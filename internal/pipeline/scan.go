@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -78,7 +79,7 @@ type Store interface {
 	Volume(ctx context.Context, id string) (store.Volume, error)
 	KnownFiles(ctx context.Context, keys []string) (map[string]store.KnownFile, error)
 	InsertUnmatchedBatch(ctx context.Context, rows []store.UnmatchedRow) (int, error)
-	TouchUnmatched(ctx context.Context, id string, size, mtime int64, resetDerived bool) error
+	TouchUnmatched(ctx context.Context, id string, size, mtime int64, d *store.Derived) error
 	TouchMedia(ctx context.Context, id string, size, mtime int64) error
 	ListLibraryPaths(ctx context.Context, libraryID string) ([]store.PathRef, error)
 	MarkMissing(ctx context.Context, refs []store.PathRef, at int64) (int, error)
@@ -343,6 +344,7 @@ func (s *Scanner) applyBatch(ctx context.Context, lib store.Library, buf []scanC
 				PathKey:   key,
 				SizeBytes: f.size,
 				MTime:     f.mtimeMS,
+				Derived:   derive(f.libRel, lib.Kind),
 			})
 			res.Added++
 			continue
@@ -361,7 +363,7 @@ func (s *Scanner) applyBatch(ctx context.Context, lib store.Library, buf []scanC
 					if err := s.store.TouchMedia(ctx, kf.ID, f.size, f.mtimeMS); err != nil {
 						return err
 					}
-				} else if err := s.store.TouchUnmatched(ctx, kf.ID, f.size, f.mtimeMS, true); err != nil {
+				} else if err := s.store.TouchUnmatched(ctx, kf.ID, f.size, f.mtimeMS, derivedPtr(f.libRel, lib.Kind)); err != nil {
 					return err
 				}
 			} else {
@@ -376,7 +378,7 @@ func (s *Scanner) applyBatch(ctx context.Context, lib store.Library, buf []scanC
 			res.NeedsReprobe = append(res.NeedsReprobe, f.volRel)
 			res.Updated++
 		case changed:
-			if err := s.store.TouchUnmatched(ctx, kf.ID, f.size, f.mtimeMS, true); err != nil {
+			if err := s.store.TouchUnmatched(ctx, kf.ID, f.size, f.mtimeMS, derivedPtr(f.libRel, lib.Kind)); err != nil {
 				return err
 			}
 			res.Updated++
@@ -435,4 +437,55 @@ func libRelPath(volRel, rootRel string) string {
 		return s
 	}
 	return path.Clean(volRel)
+}
+
+// derive 在扫描阶段就把文件名解析掉。
+//
+// 为什么不等匹配阶段再解析：28 屏是「先入库、可播放，后台慢慢补元数据」
+// （R6 结论，首扫 27 小时全在刮削）。列表要立刻有东西显示，而那行副标
+// 「文件名里没有剧名」正是解析结果，不是匹配结果。
+//
+// 解析是纯 CPU 的，5 万文件量级下耗时可忽略；真正的成本在后面的网络请求。
+func derive(relPath, libKind string) store.Derived {
+	res := domain.ParsePath(relPath)
+
+	d := store.Derived{MediaType: mediaTypeFor(libKind, res.Parsed)}
+
+	if b, err := json.Marshal(res.Parsed); err == nil {
+		d.Parsed = string(b)
+	}
+	// 只有这两条是「解析阶段就能确定、且客户端有对应文案」的。
+	// 其它情况留空，让匹配阶段去填 STRONG_MATCH / NEAR_DUPLICATE 之类。
+	//
+	// confidence 同理留 0：扫描阶段只知道"解析得怎么样"，不知道"是不是它"，
+	// 提前给个百分比会让 28 屏显示出没有依据的把握度。
+	switch res.Code {
+	case domain.ParseEpisodeWithoutSeries, domain.ParseYearOrTitleAmbiguous:
+		d.ReasonCode = string(res.Code)
+		if b, err := json.Marshal(res.Params); err == nil {
+			d.ReasonParams = string(b)
+		}
+	}
+	return d
+}
+
+func derivedPtr(relPath, libKind string) *store.Derived {
+	d := derive(relPath, libKind)
+	return &d
+}
+
+// mediaTypeFor 定这条记录的媒体类型。
+//
+// 优先看库的类型：用户把目录加成"电影库"，里面的文件就是电影，
+// 哪怕文件名里带了 S01E01（花絮、彩蛋、命名事故都常见）。
+// 只有库类型不确定（photo/music 或空）时才用解析结果兜底。
+func mediaTypeFor(libKind string, p domain.ParsedName) string {
+	switch libKind {
+	case "movie", "tv":
+		return libKind
+	}
+	if p.LooksSerial {
+		return "tv"
+	}
+	return "unknown"
 }

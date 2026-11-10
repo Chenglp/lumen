@@ -104,7 +104,7 @@ func (f *fakeStore) InsertUnmatchedBatch(_ context.Context, rows []store.Unmatch
 	return n, nil
 }
 
-func (f *fakeStore) TouchUnmatched(_ context.Context, id string, size, mtime int64, reset bool) error {
+func (f *fakeStore) TouchUnmatched(_ context.Context, id string, size, mtime int64, d *store.Derived) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, r := range f.rows {
@@ -117,7 +117,7 @@ func (f *fakeStore) TouchUnmatched(_ context.Context, id string, size, mtime int
 }
 
 func (f *fakeStore) TouchMedia(_ context.Context, id string, size, mtime int64) error {
-	return f.TouchUnmatched(context.Background(), id, size, mtime, false)
+	return f.TouchUnmatched(context.Background(), id, size, mtime, nil)
 }
 
 func (f *fakeStore) ListLibraryPaths(_ context.Context, libraryID string) ([]store.PathRef, error) {

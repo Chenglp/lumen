@@ -88,6 +88,26 @@ type UnmatchedRow struct {
 	PathKey   string // 由卷相对路径算，见 domain.VolumePathKey
 	SizeBytes int64
 	MTime     int64
+	Derived
+}
+
+// Derived 是扫描阶段就能算出、但需要落库的派生信息。
+//
+// 全部以 JSON 或枚举的形式原样存：这一层不认识它们的语义，也不该认识——
+// store 只负责存取，改文案/改判定都不该动到这里。
+type Derived struct {
+	Parsed       string  // JSON，domain.ParsedName
+	MediaType    string  // movie | tv | unknown
+	ReasonCode   string  // 契约 UnmatchedReasonCode；空表示等匹配阶段填
+	ReasonParams string  // JSON
+	Confidence   float64 // 只在匹配成功后才有意义，扫描阶段恒 0
+}
+
+func (d Derived) mediaTypeOrUnknown() string {
+	if d.MediaType == "" {
+		return "unknown"
+	}
+	return d.MediaType
 }
 
 // InsertUnmatchedBatch 在一个事务里批量插入待整理记录。
@@ -114,8 +134,9 @@ func (db *DB) InsertUnmatchedBatch(ctx context.Context, rows []UnmatchedRow) (in
 	now := Now()
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO unmatched (id, volume_id, library_id, rel_path, path_key,
-		                       size_bytes, mtime, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                       size_bytes, mtime, media_type, reason_code, reason_params,
+		                       parsed, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path_key) DO NOTHING`)
 	if err != nil {
 		return 0, fmt.Errorf("store: 预编译插入: %w", err)
@@ -125,7 +146,9 @@ func (db *DB) InsertUnmatchedBatch(ctx context.Context, rows []UnmatchedRow) (in
 	var inserted int
 	for _, r := range rows {
 		res, err := stmt.ExecContext(ctx, lib.NewID("um"), r.VolumeID, r.LibraryID,
-			r.RelPath, r.PathKey, r.SizeBytes, r.MTime, now, now)
+			r.RelPath, r.PathKey, r.SizeBytes, r.MTime,
+			r.mediaTypeOrUnknown(), nullStr(r.ReasonCode), nullStr(r.ReasonParams),
+			nullStr(r.Parsed), now, now)
 		if err != nil {
 			return 0, fmt.Errorf("store: 插入待整理 %s: %w", r.RelPath, err)
 		}
@@ -139,19 +162,25 @@ func (db *DB) InsertUnmatchedBatch(ctx context.Context, rows []UnmatchedRow) (in
 	return inserted, nil
 }
 
-// TouchUnmatched 更新一条已存在记录的 stat，并清空派生的解析结果。
+// TouchUnmatched 更新一条已存在记录的 stat；d 非 nil 时同时重写派生字段。
 //
-// resetDerived 为 true 表示文件内容变了（size 或 mtime 变了），
-// 之前解析出的片名/季集号/ffprobe 结果都失效，必须重跑；
+// 传 nil 表示文件只是回来了（stat 没变），解析结果仍然有效，不该重算；
+// 传 d 表示内容变了，之前解析出的片名/季集号都失效，必须重跑——
 // 留着旧结果会让 28 屏显示一部已经不存在的片子。
-func (db *DB) TouchUnmatched(ctx context.Context, id string, size, mtime int64, resetDerived bool) error {
+//
+// probe 不在这里清：ffprobe 必须在写锁外跑（R4 结论），由扫描器把路径
+// 收集起来交给探测阶段。
+func (db *DB) TouchUnmatched(ctx context.Context, id string, size, mtime int64, d *Derived) error {
 	var err error
-	if resetDerived {
+	if d != nil {
 		_, err = db.rw.ExecContext(ctx, `
 			UPDATE unmatched
-			SET size_bytes = ?, mtime = ?, parsed = NULL, probe = NULL,
+			SET size_bytes = ?, mtime = ?, parsed = ?, media_type = ?,
+			    reason_code = ?, reason_params = ?, probe = NULL,
 			    confidence = 0, missing_since = NULL, updated_at = ?
-			WHERE id = ?`, size, mtime, Now(), id)
+			WHERE id = ?`,
+			size, mtime, nullStr(d.Parsed), d.mediaTypeOrUnknown(),
+			nullStr(d.ReasonCode), nullStr(d.ReasonParams), Now(), id)
 	} else {
 		_, err = db.rw.ExecContext(ctx, `
 			UPDATE unmatched
@@ -162,6 +191,17 @@ func (db *DB) TouchUnmatched(ctx context.Context, id string, size, mtime int64, 
 		return fmt.Errorf("store: 更新待整理 %s: %w", id, err)
 	}
 	return nil
+}
+
+// nullStr 把空串写成 SQL NULL。
+//
+// 不用 sql.NullString：这几列全部是「有值就是有，没值就空」，空串与 NULL
+// 在这里没有语义差别，但 NULL 能让 `IS NULL` 的查询和后续迁移简单得多。
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // TouchMedia 更新一条已入库记录的 stat。

@@ -46,12 +46,18 @@ func run() error {
 		probeSample = flag.String("sample", "", "探测用的片源（不给则取库里最高/最大的一个）")
 		probeFast   = flag.Bool("probe-fast", false, "快速探测：跳过 4K 与 DV tonemap 两项")
 		probeSoft   = flag.Bool("probe-soft", false, "强制用软编探测（验证 M/L 档分支）")
+		parseArg    = flag.String("parse", "", "只跑文件名解析：目录则遍历其中视频文件，其它值当作文件名，解析后退出")
 	)
 	flag.Parse()
 
 	if *showVer {
 		fmt.Printf("lumen %s (commit %s, built %s)\n", version, commit, buildTime)
 		return nil
+	}
+
+	// -parse 不碰数据库：解析是纯函数，验证它不该要求先建库。
+	if *parseArg != "" {
+		return runParse(*parseArg)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -239,4 +245,86 @@ func defaultDataDir() string {
 		return "."
 	}
 	return filepath.Join(base, "Lumen")
+}
+
+// runParse 打印文件名解析结果。
+//
+// 存在的理由和 -probe 一样：解析器的输出直接决定 28 屏每行副标与搜索词，
+// 而真实库里的名字千奇百怪。拿真目录跑一遍，比在单测里编例子可信得多。
+func runParse(arg string) error {
+	fi, err := os.Stat(arg)
+	if err != nil || !fi.IsDir() {
+		// 不是目录就当成一条文件名（可以带引号传整串）
+		printParsed(arg, domain.ParsePath(arg))
+		return nil
+	}
+
+	root := arg
+	var n int
+	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // 读不到的目录跳过，解析演示不该因为权限中断
+		}
+		if d.IsDir() {
+			if p != root && domain.IsJunk(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !domain.IsVideoFile(d.Name()) {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			rel = d.Name()
+		}
+		printParsed(filepath.ToSlash(rel), domain.ParsePath(filepath.ToSlash(rel)))
+		n++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		fmt.Println("目录里没有受支持的视频文件")
+	}
+	return nil
+}
+
+func printParsed(rel string, r domain.ParseResult) {
+	p := r.Parsed
+
+	year := "-"
+	if p.Year != nil {
+		year = fmt.Sprint(*p.Year)
+	}
+	se := "-"
+	if p.Season != nil && p.Episode != nil {
+		se = fmt.Sprintf("S%02dE%02d", *p.Season, *p.Episode)
+	} else if p.Season != nil {
+		se = fmt.Sprintf("S%02d", *p.Season)
+	} else if p.Episode != nil {
+		se = fmt.Sprintf("E%02d", *p.Episode)
+	} else if p.SeasonPack {
+		se = "整季包"
+	}
+
+	fmt.Printf("\n%s\n", rel)
+	fmt.Printf("  标题  %s\n", orDash(p.Title))
+	fmt.Printf("  年份  %s   季集  %s   来源  %s\n", year, se, r.TitleFrom)
+	fmt.Printf("  规格  %s / %s / %s\n", orDash(p.Resolution), orDash(p.Source), orDash(p.ReleaseGroup))
+	fmt.Printf("  判定  %s\n", r.Code)
+	for _, w := range r.Warnings {
+		fmt.Printf("  提醒  %s %v\n", w.Code, w.Params)
+	}
+	if p.VideoCodec != "" || p.AudioCodec != "" || len(p.Tags) > 0 {
+		fmt.Printf("  编码  %s %s %s / %v\n", p.VideoCodec, p.AudioCodec, p.AudioChannels, p.Tags)
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }

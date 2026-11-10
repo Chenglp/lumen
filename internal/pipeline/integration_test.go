@@ -2,12 +2,16 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Chenglp/lumen/internal/domain"
 	"github.com/Chenglp/lumen/internal/store"
 )
 
@@ -253,5 +257,120 @@ func BenchmarkScanWithDB(b *testing.B) {
 		if _, err := sc.ScanLibrary(ctx, "lib_1", nil); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// 解析结果必须真的落到 unmatched 表里。
+//
+// 上一条端到端测试抓出过「media 缺 mtime 列」这类问题——假 store 全绿，
+// 真 SQLite 直接报 no such column。解析这条路径有一模一样的风险：
+// 列名写错、JSON 没写进去、reason_code 落了空，假 store 一个都发现不了。
+func TestScanPersistsParseResult(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "lumen.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	volRoot := t.TempDir()
+	libRoot := filepath.Join(volRoot, "media", "movie")
+	if err := os.MkdirAll(libRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	if _, err := db.Write().ExecContext(ctx, `
+		INSERT INTO volumes(id, volume_key, kind, mount_hint, watch_mode, status, created_at, updated_at)
+		VALUES ('vol_1','vk1','local',?,'native','online',?,?)`, volRoot, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Write().ExecContext(ctx, `
+		INSERT INTO libraries(id, volume_id, root_rel, path_key, kind, name, enabled, created_at, updated_at)
+		VALUES ('lib_1','vol_1','media/movie','pk','movie','电影',1,?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(rel, body string) {
+		p := filepath.Join(libRoot, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("写 %s: %v", rel, err)
+		}
+	}
+	write("Interstellar.2014.2160p.BluRay.x265-TERMiNAL.mkv", "a")
+	write("2012.mkv", "b")
+	write("Show/Season 2/S02E04.mkv", "c")
+
+	sc := NewScanner(db)
+	if _, err := sc.ScanLibrary(ctx, "lib_1", nil); err != nil {
+		t.Fatalf("扫描: %v", err)
+	}
+
+	type row struct {
+		parsed     string
+		mediaType  string
+		reasonCode sql.NullString
+		reasonPrms sql.NullString
+	}
+	load := func(rel string) row {
+		var r row
+		var mt sql.NullString
+		if err := db.Read().QueryRowContext(ctx, `
+			SELECT COALESCE(parsed,''), COALESCE(media_type,''), reason_code, reason_params
+			FROM unmatched WHERE rel_path = ?`, rel).
+			Scan(&r.parsed, &mt, &r.reasonCode, &r.reasonPrms); err != nil {
+			t.Fatalf("查 %s: %v", rel, err)
+		}
+		r.mediaType = mt.String
+		return r
+	}
+
+	// ① 标准发布名：标题与年份都要解析出来，且没有 reason_code
+	r := load("Interstellar.2014.2160p.BluRay.x265-TERMiNAL.mkv")
+	var p domain.ParsedName
+	if err := json.Unmarshal([]byte(r.parsed), &p); err != nil {
+		t.Fatalf("parsed 不是合法 JSON: %v（%q）", err, r.parsed)
+	}
+	if p.Title != "Interstellar" || p.Year == nil || *p.Year != 2014 {
+		t.Errorf("解析结果不对：title=%q year=%v", p.Title, p.Year)
+	}
+	if p.Resolution != "2160p" || p.ReleaseGroup != "TERMiNAL" {
+		t.Errorf("技术标记不对：res=%q group=%q", p.Resolution, p.ReleaseGroup)
+	}
+	if r.mediaType != "movie" {
+		t.Errorf("media_type = %q，期望 movie（跟随库类型）", r.mediaType)
+	}
+	if r.reasonCode.Valid {
+		t.Errorf("正常解析不该带 reason_code，实际 %q", r.reasonCode.String)
+	}
+
+	// ② 年份歧义：reason_code 与 params 都要落库
+	r = load("2012.mkv")
+	if r.reasonCode.String != string(domain.ParseYearOrTitleAmbiguous) {
+		t.Errorf("reason_code = %q，期望 %q", r.reasonCode.String, domain.ParseYearOrTitleAmbiguous)
+	}
+	if !strings.Contains(r.reasonPrms.String, `"token":"2012"`) {
+		t.Errorf("reason_params 应带 token：%q", r.reasonPrms.String)
+	}
+	if err := json.Unmarshal([]byte(r.parsed), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Year != nil {
+		t.Errorf("歧义年份必须留空，实际 %d", *p.Year)
+	}
+
+	// ③ 剧名在目录里：文件名只有季集号
+	r = load("Show/Season 2/S02E04.mkv")
+	if err := json.Unmarshal([]byte(r.parsed), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Title != "Show" || p.Season == nil || *p.Season != 2 || p.Episode == nil || *p.Episode != 4 {
+		t.Errorf("S02E04 解析不对：%+v", p)
 	}
 }
