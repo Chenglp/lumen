@@ -1,0 +1,58 @@
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Go ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/dist/
+vendor/
+
+# --- Rust / Tauri ---
+target/
+**/target/
+Cargo.lock.bak
+
+# --- Node (UI) ---
+node_modules/
+.npm/
+*.tsbuildinfo
+
+# --- Lumen runtime ---
+*.db
+*.db-wal
+*.db-shm
+lumen.db*
+/cache/
+/thumbs/
+/hls/
+*.log
+
+# --- Media (never commit a library) ---
+*.mkv
+*.mp4
+*.m4v
+*.avi
+*.ts
+*.flac
+*.m4a
+*.mp3
+*.jpg
+*.jpeg
+*.png
+*.heic
+
+# screenshots are the one exception
+!screenshots/*.jpg
+
+# --- Editor ---
+.vscode/
+.idea/
+*.swp
