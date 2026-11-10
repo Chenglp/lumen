@@ -2217,6 +2217,19 @@ components:
         hdr:
           type: [string, "null"]
           enum: [hdr10, hlg, dolby_vision, sdr, null]
+        dvProfile:
+          type: [integer, "null"]
+          enum: [5, 7, 8, null]
+          description: |
+            Dolby Vision 的 profile。`hdr=dolby_vision` 时必填，其余为 null。
+
+            这个字段不是锦上添花：**profile 5 与 7/8 的回退行为完全不同**。
+            - 5（流媒体常见）：IPTPQc2 色彩空间，**没有 HDR10 兼容基础层**。不支持 DV 的
+              客户端拿到它不会报错，而是直接当 YCbCr 解出**整片偏绿**的画面——静默出错。
+            - 7/8：带 HDR10 基础层，非 DV 客户端可以当 HDR10 播，颜色基本正确。
+
+            所以客户端判定要为 5 单独走一条：`dvProfile==5 && !caps.hdr.dolby_vision`
+            → 必须转码（tonemap），不能 direct play。
         bitDepth:
           type: integer
           enum: [8, 10, 12]

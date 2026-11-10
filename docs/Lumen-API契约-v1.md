@@ -1016,6 +1016,22 @@ checkpoint 间隔：扫描类每 200 个文件，转码每 1 个分片，刮削�
 
 **这一条为什么不违背「先播再报错」**：依据 `containers`——AVPlayer 打不开 matroska 是**确定性事实**，不是概率。分界线是「**能不能打开**可以查，**能不能解好**只能试」。
 
+**规则 0b · Dolby Vision Profile 5 + 客户端无 DV → `transcode`（唯一一条"确定性色彩错误"）**
+
+| 条件 | 说明 |
+|---|---|
+| ① 客户端已通过 `PUT /devices/{id}/caps` 上报 `hdr` | **未上报则整条跳过**，走 `direct` |
+| ② 源 `video.hdr = dolby_vision` 且 `video.dvProfile = 5` | 只有 profile 5 要判，7/8 不在此列 |
+| ③ 客户端 `hdr.dolby_vision = false` | 支持 DV 的客户端直连即可，不占转码槽 |
+
+**为什么这条也必须前置，而不能"先播再报错"**：DV Profile 5 用 IPTPQc2 编码，且**没有 HDR10 兼容基础层**。不支持 DV 的解码器会把它当普通 YCbCr 解出来——结果是**整片偏绿**，不是黑屏、不是报错、不中断。实测同一帧：朴素解码水面是惨绿色、高光全部丢失；经 libplacebo reshape + tonemap 后才是正常的蓝色与金色反光（框架 §9 R1）。
+
+这是本项目**唯一一种「画面错了但不报警」的失败**。32 屏的整套诊断都挂在 `error` / `playback_failed` 上，色彩错误永远不会触发它们——用户只会觉得"这部电影色调有点怪"，然后把锅算在片源上。规则 0 依据的是"能不能打开"，这条依据的是"颜色对不对"，两者都是**确定性事实**，都可以查。
+
+Profile 7/8 相反：它们带 HDR10 基础层，非 DV 客户端当 HDR10 播**颜色是正确的**，只是少了动态元数据。把 5 和 7/8 混成一个 `dolby_vision` 枚举，就是这条规则存在的理由。
+
+**代价（必须同时实现，否则这条规则会把机器拖死）**：DV→SDR 的 tonemap 实测只有 **1.18× 实时**，且**与输出分辨率无关**（720p 与 1080p 都是 72 fps），降档救不回来。所以 profile 5 生效时，这台机器**同时只允许 1 路 tonemap**，其余请求排队并如实给 `queuePosition` + `estWaitMs`。这条不写进实现，两个人都看 DV 片时就是两个人一起卡。
+
 **规则 1–4 · `transcode`**
 
 | # | 条件 | 结果 |
@@ -1047,6 +1063,7 @@ checkpoint 间隔：扫描类每 200 个文件，转码每 1 个分片，刮削�
 | `source.protocol` | enum | 否 | `http` = 原文件 progressive（**仅 `direct`**，支持 Range 可任意拖动）；`hls` = fMP4 分片（**`transcode` 与 `remux` 都必须走这条**）。`remux` 给 `http` 会导致进度条拖不动 |
 | `source.container` | string | 否 | 客户端**实际拿到**的容器；`remux` / `transcode` 后为 `fmp4`。原文件容器留在库中，不在响应里重复 |
 | `source.video.hdr` | enum | 是 | `hdr10` \| `hlg` \| `dolby_vision` \| `sdr` \| `null` |
+| `source.video.dvProfile` | int | 是 | `5` \| `7` \| `8` \| `null`。`hdr=dolby_vision` 时必填。**5 与 7/8 的回退行为完全不同**：5 没有 HDR10 基础层，非 DV 客户端拿到会静默偏绿（规则 0b）；7/8 可当 HDR10 播 |
 | `source.video.bitDepth` | int | 否 | 8/10/12 |
 | `source.audio[].channelLayout` | string | 是 | 驱动「国语 5.1」中的 5.1 |
 | `source.subtitles[].url` | string | 是 | 外挂字幕直链；内封为 `null`（由客户端从容器里取） |
@@ -1850,7 +1867,13 @@ OpenAPI 里 WS 帧结构放在 `components/schemas/WsEvent`，`/stream` 无法�
 
 ---
 
-*文档版本 v1.8 · 2026-11-11 · 对应设计稿 32 屏（fileId 745649420954674）*
+*文档版本 v1.9 · 2026-11-11 · 对应设计稿 32 屏（fileId 745649420954674）*
+
+**v1.9 变更**（真实 DV P5 片源实测后补的第 5 个播放缺口）：
+1. `source.video` 新增 **`dvProfile`**（`5` \| `7` \| `8` \| `null`）。原模型用一个 `dolby_vision` 枚举概括了两种回退行为完全不同的东西：profile 5 没有 HDR10 基础层，非 DV 客户端拿到**不报错、整片偏绿**；profile 7/8 可以当 HDR10 播且颜色正确
+2. 新增**规则 0b**：`hdr=dolby_vision && dvProfile=5 && 客户端 hdr.dolby_vision=false` → `transcode`。这是唯一一条"画面错了但不报警"的失败，32 屏的诊断完全接不住它，所以必须前置判
+3. 规则 0b 附带实现约束：profile 5 生效时**每台机器同时只允许 1 路 tonemap**，其余排队给 `queuePosition`。依据是实测 DV→SDR 仅 1.18× 实时且降分辨率无效（框架 §9 R1）
+4. 未上报 `caps` 时规则 0b 与规则 0 一样跳过，走 `direct`——保持"上报才有特权"的一致语义
 
 **v1.8 变更**（07 屏左栏定性为段落索引，补齐两个死链分类）：
 1. 新增 §5.5：07 屏左栏是**段落索引**，不是页面切换。四个分类必须在同一页上有内容，高亮随滚动位置（scroll spy）切换。原设计 4 项里有两项点了没有任何目标
