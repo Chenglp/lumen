@@ -30,9 +30,9 @@ test:
 
 # 竞态检测：store 的双句柄设计必须验，否则并发写会静默丢数据。
 #
-# 注意：-race 需要 cgo，与上面的 CGO_ENABLED=0 相反，且本机需要有 C 编译器
-# （Windows 上是 mingw-w64 / TDM-GCC）。没装就只在 CI（Linux）上跑。
-# 用法：CGO_ENABLED=1 make race
+# -race 需要 cgo（ThreadSanitizer 是 C++ runtime），与上面的 CGO_ENABLED=0 相反。
+# 本机需要 C 编译器（Windows 上是 mingw-w64，已装 WinLibs POSIX UCRT）。
+# 发布产物不受影响：build 目标仍然 CGO_ENABLED=0，输出纯 Go 单文件。
 race:
 	CGO_ENABLED=1 go test ./... -race -count=1
 

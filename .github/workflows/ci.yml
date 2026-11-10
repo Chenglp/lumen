@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+  race:
+    # 竞态检测单独一个 job：它慢 5–20 倍，失败时不该拖住主流程，
+    # 而且它必须开 cgo（ThreadSanitizer 是 C++ runtime）。
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test -race
+        run: go test ./... -race -count=1
+
+  contract:
+    # 契约是这件事的唯一真相源；它坏掉比代码坏掉更贵——
+    # 代码编译失败一眼能看见，契约里一个断链的 $ref 要到生成客户端时才炸。
+    name: openapi contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyyaml
+        run: python -m pip install --quiet pyyaml
+
+      - name: Validate openapi
+        run: python docs/check-openapi.py
