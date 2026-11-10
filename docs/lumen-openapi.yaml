@@ -1,0 +1,2898 @@
+openapi: 3.1.0
+
+info:
+  title: Lumen API
+  version: 1.0.0
+  summary: 自托管私人影音库 · 服务端 HTTP/WS 契约
+  description: |
+    Lumen 服务端（Go + SQLite）对桌面端（Tauri/React）与移动端（React Native）的接口契约。
+    配套文档见 `Lumen-API契约-v1.md`，本文件是其机器可读形式。
+
+    ## 三条硬规则
+
+    1. **先播再报错**：`GET /play/{mediaId}` 默认返回 `mode: direct`，不因"可能播不了"而转码；
+       仅在四种确定不可能时降级（见 `PlayInfo.mode` 描述）。
+       `GET /play/{mediaId}/capability` 是**可选**接口，禁止串到起播路径上。
+    2. **服务端只给数字 + 原因码**：所有含数字的界面文案由客户端渲染，
+       服务端返回 `reasonCode` + `reasonParams`。例外：`Task.title`、`Diagnosis.detail.video/audio`、`Action.label`。
+    3. **写操作幂等**：`POST` 支持 `Idempotency-Key`（24h）；列表一律游标分页，不用 offset。
+
+    ## 单位约定
+    时长 `*Ms` 一律整数毫秒；体积 `*Bytes` 一律字节；时间 RFC 3339 带时区。
+  contact:
+    name: Lumen
+  license:
+    name: Private
+
+servers:
+  - url: "http://{host}:8686/api/v1"
+    description: 内网直连 / Tailscale 组网
+    variables:
+      host:
+        default: 192.168.1.24
+        description: NAS 的 LAN 地址或 100.x 组网地址
+
+tags:
+  - name: A. 媒体整理
+    description: 未识别文件的确认、忽略、批量匹配（设计稿 28 屏）
+  - name: B. 任务
+    description: 扫描/刮削/转码任务的排队、进度与调度（29 屏）
+  - name: C. 设备
+    description: 设备授权、配对、远程访问（30 屏）
+  - name: D. 播放
+    description: 起播、失败诊断、降级（31/32 屏 + 24 屏设置面板）
+  - name: E. 设置
+    description: 元数据源（TMDB）凭据、语言、代理、缓存（07 屏）
+
+security:
+  - deviceToken: []
+
+paths:
+  # ============================================================ A. 媒体整理
+  /unmatched:
+    get:
+      tags: [A. 媒体整理]
+      operationId: listUnmatched
+      summary: 待处理列表
+      description: |
+        返回指定状态的文件记录 + 三个 tab 的计数。
+        `counts` 与 `items` 在**同一事务**内取，永远自洽，不做缓存、不做 30 秒节流：
+        `status` 上有索引，万级库的 `COUNT(*)` 是亚毫秒级，为它引入滞后不划算。
+        `countsAsOf` 预留给将来真的需要缓存时（50 万行以上）客户端做"可能已变化"提示。
+      parameters:
+        - $ref: "#/components/parameters/Status"
+        - $ref: "#/components/parameters/MediaTypeFilter"
+        - $ref: "#/components/parameters/SortUnmatched"
+        - $ref: "#/components/parameters/Query"
+        - $ref: "#/components/parameters/LibraryId"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnmatchedList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /unmatched/{id}/candidates:
+    get:
+      tags: [A. 媒体整理]
+      operationId: listCandidates
+      summary: 候选（右栏）
+      description: |
+        服务端已按 score 排序的候选。`refresh=true` 对应「换一批」，换排序种子轮换同分候选，
+        但 `recommended: true` 的那条必须仍排第一。
+
+        **单页硬上限 20，不分页**——本操作没有 `page`/`offset`，实现时也不许加。
+        依据：24 条真实剧名实测 `hit@5 = 96%`，正确项几乎总在前 5；多翻一页让全库首扫请求数
+        翻倍（5 万文件已约 27 小时），换不回排序质量。排序问题只能靠更好的信号解决（见
+        `CandidateItem.score`），不能靠翻页。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: refresh
+          in: query
+          schema: { type: boolean, default: false }
+          description: 跳过缓存并换排序种子
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CandidateList"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /tmdb/search:
+    get:
+      tags: [A. 媒体整理]
+      operationId: searchTmdb
+      summary: 手动搜索 / TMDB ID 直查
+      description: |
+        `q` 为纯数字且 ≤7 位时按 tmdbId 直查（对应设计稿"或直接输入 TMDB ID"）。
+        元数据源不可达返回 `503 METADATA_SOURCE_UNAVAILABLE`，**不是 404**——用户需知道是网络问题而非搜不到。
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [multi, movie, tv]
+            default: multi
+        - name: year
+          in: query
+          schema: { type: integer, minimum: 1870, maximum: 2200 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 20, default: 10 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TmdbSearchResult"
+        "503":
+          $ref: "#/components/responses/MetadataSourceUnavailable"
+
+  /media/{id}/match:
+    post:
+      tags: [A. 媒体整理]
+      operationId: matchMedia
+      summary: 确认为某部影片 / 某一集
+      description: |
+        入库后该记录**立即**从 `GET /unmatched?status=pending` 消失，`counts` 相应减少。
+        客户端不要本地删行——游标分页删行会让游标错位，应重取首屏。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MatchRequest"
+      responses:
+        "200":
+          description: 已入库
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MatchResponse"
+        "409":
+          description: "`ALREADY_MATCHED` / `FILE_MISSING`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: "`EPISODE_OUT_OF_RANGE`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /media/{id}/ignore:
+    post:
+      tags: [A. 媒体整理]
+      operationId: ignoreMedia
+      summary: 忽略
+      description: |
+        默认 `ttlDays: null` = **永久忽略**，这是 28 屏「忽略」按钮的唯一行为。
+        给正整数则 N 天后自动回归 `pending`（文件改名后能被重新捡起）。
+        TTL 是保留能力，一期客户端不给入口——因为它需要一个后台定时任务，
+        且过期会造成 28 屏待整理数周期性回弹（"忽略过的垃圾又回来了"）。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IgnoreRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IgnoreResponse"
+
+  /unmatched/batch-match:
+    post:
+      tags: [A. 媒体整理]
+      operationId: batchMatch
+      summary: 批量自动匹配
+      description: "异步。`dryRun: true` 只返回将被处理的数量供二次确认，不写库。"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchMatchRequest"
+      responses:
+        "200":
+          description: 已入队
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchMatchResponse"
+
+  # ============================================================ B. 任务
+  /tasks:
+    get:
+      tags: [B. 任务]
+      operationId: listTasks
+      summary: 整屏任务数据
+      description: 29 屏是单屏四块（当前/等待/最近/定时），一次给全，避免客户端并发 4 个请求后做时序对齐。
+      parameters:
+        - name: recentLimit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 5 }
+        - name: recentDays
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 90, default: 7 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TasksScreen"
+    post:
+      tags: [B. 任务]
+      operationId: createTask
+      summary: 新建任务（"重新扫描"）
+      description: |
+        `dedupe: true`（默认）时若同 kind + 同 target 已在队列/运行，
+        返回 `409 TASK_EXISTS` + `detail.existingTaskId`，客户端应跳转而非报错。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTaskRequest"
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: "`TASK_EXISTS`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /stream:
+    get:
+      tags: [B. 任务]
+      operationId: streamEvents
+      summary: 统一事件流（WebSocket）
+      description: |
+        握手后立即收到一帧 `snapshot`：`{tasks, devices}`，客户端全量替换两个 store。
+
+        **v1.1**：原 `/tasks/stream` 改名 `/stream`。这条通道现在也推设备事件，
+        而"一个客户端只允许 1 条连接"意味着不能再单开一条。
+
+        - `since` 用于断线重连补发：服务端保留最近 1024 条事件（内存环形缓冲），
+          `since` 小于窗口下界时改推 `snapshot` 让客户端全量替换。
+        - `seq` 单调递增。客户端发现跳跃 → 主动 `GET /tasks` 校正，不要试图补帧。
+        - `task.progress` 节流 500ms 或 percent 变化 ≥1，**不落库**（扫描万文件不产生万次写）。
+        - `firstSegmentReady` 变化**不受节流**，立即推一帧，否则 `estStartupMs: 8000` 变成 8.5 秒。
+        - `device.*` 只在**持久属性**变化时推（改名/改权限/撤销/配对）；在线态不进事件，
+          靠 `GET /devices` 每 30 秒轮询。
+        - **未知 `type` 必须忽略，不得断开连接**——后续加事件类型不破坏老客户端。
+        - 一个客户端只允许 1 条连接，新连接会以 code 4000 关闭旧连接。
+        - 45 秒无任何帧（含 heartbeat）则客户端主动重连，退避 1/2/4/8/30s。
+      parameters:
+        - name: since
+          in: query
+          schema: { type: integer, minimum: 0 }
+          description: 上次收到的最后一个 seq
+      responses:
+        "101":
+          description: Switching Protocols
+        "426":
+          description: 需要 Upgrade
+
+  /tasks/{id}/pause:
+    post:
+      tags: [B. 任务]
+      operationId: pauseTask
+      summary: 暂停（协作式）
+      description: |
+        **返回 202 时 `state` 仍是 `running`**，只是 `pauseRequestedAt` 非空——
+        服务端在下一个 checkpoint（扫描每 200 文件 / 转码每分片 / 刮削每 10 请求）才真正停。
+        客户端应禁用按钮并显示"正在暂停…"，真正的 `paused` 从 WS `task.state` 来。
+        转码任务的 pause 语义是"暂停推流但会话保活"。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionAccepted"
+        "409":
+          description: "`NOT_PAUSABLE` / `ALREADY_PAUSED` / `TASK_FINISHED`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /tasks/{id}/resume:
+    post:
+      tags: [B. 任务]
+      operationId: resumeTask
+      summary: 继续
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionAccepted"
+        "409":
+          description: "`NOT_PAUSED` / `TASK_FINISHED`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /tasks/{id}/cancel:
+    post:
+      tags: [B. 任务]
+      operationId: cancelTask
+      summary: 取消
+      description: |
+        202 返回时仍是 `running` + `cancelRequestedAt`；真正 `canceled` 由 WS 通知。
+        `state` 变 `canceled` 时服务端已清完半成品（缩略图、未提交的入库）。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionAccepted"
+
+  /tasks/{id}/priority:
+    post:
+      tags: [B. 任务]
+      operationId: reorderTask
+      summary: 置顶 / 移到某位
+      description: 仅 `queued` 可用；`running` 返回 `409 NOT_QUEUED`。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [position]
+              properties:
+                position:
+                  type: integer
+                  minimum: 0
+                  description: 0-based；超过队列长度按末位处理
+      responses:
+        "200":
+          description: 返回重排后的队列（省一次 GET）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queued]
+                properties:
+                  queued:
+                    type: array
+                    items: { $ref: "#/components/schemas/Task" }
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /tasks/{id}:
+    delete:
+      tags: [B. 任务]
+      operationId: removeQueuedTask
+      summary: 移除排队任务
+      description: 仅 `queued`；`running` 请用 cancel。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "204":
+          description: 已移除
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /tasks/schedule:
+    put:
+      tags: [B. 任务]
+      operationId: updateSchedule
+      summary: 定时增量扫描
+      description: |
+        `nextRunAt` 必须由服务端算——客户端算 cron 会和夏令时/时区打架。
+        `skipIfNoChange: true` 时被跳过的运行**不产生** recent 记录，但服务端保留 `lastCheckedAt`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScheduleUpdate"
+      responses:
+        "200":
+          description: 返回完整 schedule（含重算的 nextRunAt）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "422":
+          description: "`INVALID_CRON`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ============================================================ C. 设备
+  /devices:
+    get:
+      tags: [C. 设备]
+      operationId: listDevices
+      summary: 设备列表 + 远程访问
+      description: |
+        `online` 由服务端按心跳判定（`now - lastSeenAt < 90s`），不给客户端时间阈值。
+        已撤销的设备仍留在列表里（`revokedAt != null`），不物理删除——播放记录要保留关联。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DevicesScreen"
+
+  /devices/{id}:
+    patch:
+      tags: [C. 设备]
+      operationId: updateDevice
+      summary: 改名 / 改权限
+      description: |
+        `name` 与 `permissions` 均可选，但至少给一个。
+        `isSelf: true` 的设备不允许改 `permissions` → `403 CANNOT_MODIFY_SELF`。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                permissions:
+                  type: array
+                  items: { $ref: "#/components/schemas/DevicePermission" }
+      responses:
+        "200":
+          description: 更新后的设备
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [C. 设备]
+      operationId: revokeDevice
+      summary: 撤销访问
+      description: |
+        token 立即失效；若正在播放，服务端在 `disconnectDeadline` 强断（设计稿承诺"60 秒内断开"）。
+        `?purge=true` 同时清理该设备的播放记录，不可逆，需二次确认。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: purge
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "202":
+          description: 已撤销
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeResult"
+
+  /devices/{id}/caps:
+    put:
+      tags: [C. 设备]
+      operationId: reportDeviceCaps
+      summary: 上报播放器能力（客户端发起）
+      description: |
+        **由设备自己调用**，用该设备的 token 鉴权——不能用 `manage_devices` 权限代填，
+        因为能力描述的是"这台机器上这个播放器能干什么"，不是管理员能授予的东西。
+
+        调用时机：客户端启动时一次；播放器大版本升级后一次。
+        服务端只存最新值，不保留历史。
+
+        **为什么单独一个端点，而不是塞进 `GET /play` 的 query**：
+        `ClientCaps` 是个嵌套对象（`containers` / `codecs` / `audio` / `hdr`），塞进 query 会超长且难校验。
+        更重要的是——`GET /play` 的承诺是 p99 < 5ms 的**纯 DB 读 + 签名**。
+        把 caps 作为入参意味着每次起播都要解析一遍，还会让同一台设备的判定结果依赖"这次请求带了什么"。
+        存下来，`/play` 只读一行，行为可复现。
+
+        **未上报的后果是安全的**：`/play` 跳过 remux 判定，一律 `direct`，
+        真播不了再走 `error` → `fallback`。即"能力未知"退化成"先播再报错"，不会被误拦。
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientCaps"
+      responses:
+        "200":
+          description: 已保存
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [declaredAt]
+                properties:
+                  declaredAt: { type: string, format: date-time }
+        "403":
+          description: "`CAPS_DEVICE_MISMATCH` —— 只能上报自己的能力"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /devices/pairing:
+    post:
+      tags: [C. 设备]
+      operationId: createPairingCode
+      summary: 生成配对码
+      description: |
+        同一时刻最多 1 个有效码，重复调用覆盖旧码（旧码立刻失效）。
+        `code` 是 **6 位数字字符串**，不要当 int——前导 0 会丢。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channel:
+                  type: string
+                  enum: [lan, tailscale]
+                  default: lan
+                  description: 码只在该通道有效
+                ttlSec:
+                  type: integer
+                  minimum: 60
+                  maximum: 600
+                  default: 300
+      responses:
+        "201":
+          description: 已生成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingCode"
+    get:
+      tags: [C. 设备]
+      operationId: getPairingCode
+      summary: 取当前有效码
+      responses:
+        "200":
+          description: 当前有效码
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingCode"
+        "204":
+          description: 无有效码（UI 显示"点击生成"）
+
+  /devices/pair:
+    post:
+      tags: [C. 设备]
+      operationId: pairDevice
+      summary: 新设备凭码接入
+      description: |
+        由**待接入设备**调用，此端点**免** `X-Lumen-Device`（否则鸡生蛋）。
+        `deviceToken` 只返回这一次，服务端只存哈希；丢了必须重新配对。
+        新设备默认只有 `play`。`manage_library` / `manage_devices` 需在已授权设备上手动勾——
+        手机丢了不等于库被删，客厅电视能播也不等于能删片。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairRequest"
+      responses:
+        "200":
+          description: 已接入
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairResponse"
+        "404":
+          description: "`PAIRING_CODE_NOT_FOUND`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: "`PAIRING_CODE_EXPIRED`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "`TOO_MANY_ATTEMPTS`，同 IP 5 分钟内 5 次失败锁 15 分钟"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /remote-access:
+    put:
+      tags: [C. 设备]
+      operationId: updateRemoteAccess
+      summary: 外网串流开关
+      description: |
+        给 `externalMaxHeight: 2160` → `422 EXTERNAL_4K_NOT_ALLOWED`。
+        4K 外网转码会打满 CPU，这条限制写死在服务端。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RemoteAccessUpdate"
+      responses:
+        "200":
+          description: 完整 remoteAccess（含状态）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoteAccess"
+        "422":
+          description: "`EXTERNAL_4K_NOT_ALLOWED`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ============================================================ D. 播放
+  /play/{mediaId}:
+    get:
+      tags: [D. 播放]
+      operationId: getPlayInfo
+      summary: 起播源（默认直连）
+      description: |
+        **不返回任何"能不能播"的预判**。只回答"源在哪、有什么轨"。
+
+        ## 规则 0（先判）：容器打不开 → `remux`，不是 `transcode`
+
+        以下四条**同时成立**才给 `remux`：
+
+        1. 客户端已通过 `PUT /devices/{id}/caps` 上报 `containers`；**未上报则整条跳过，走 `direct`**
+        2. 源 `container` 不在该 `containers` 里（如 iOS 拿到 `matroska`）
+        3. `source.video.codec` 在客户端 `codecs` 里为 `true` —— 编码本身能解，只有壳不对
+        4. 存在至少一条音轨，其 `codec` 在客户端 `audio` 里为 `true`；
+           若没有但编码可解，则**退化为 `transcode` 并在响应里给出 `audioIndex`**（此时要重编音频）
+
+        外加前置：`probe.ok=true`（已知损坏的文件直接进 `transcode`，见规则 3）。
+
+        **为什么这一条不算违背"先播再报错"**：规则 2 依据的是 `containers`——
+        AVPlayer 打不开 matroska 是**确定性事实**，不是概率。这与"HEVC 10bit HDR 可能渲染不出"
+        性质完全不同，后者只能在播起来之后才知道。判定的分界线是
+        **"能不能打开"可以查，"能不能解好"只能试**。
+
+        ## 规则 1–4：`transcode`
+
+        `mode` 只在四种确定情况下为 `transcode`：
+        1. 请求来自 tailscale/public 且 `allowExternalStream` 且源高 > `externalMaxHeight`
+        2. 客户端显式 `mode=transcode`
+        3. 文件 `probe.ok=false`（已知损坏，转码做 remux 修复尝试）
+        4. 同 mediaId 同设备 30 分钟内失败过且原因已判定为必转码
+
+        其余一律 `direct`——包括"HEVC 10bit HDR 可能播不了""音轨是 DTS 可能没声"这类不确定项。
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - name: resume
+          in: query
+          schema: { type: boolean, default: true }
+          description: "false → 从头播，`resumePositionMs` 返回 null"
+        - name: episodeId
+          in: query
+          schema: { type: string }
+          description: 剧集指定具体集；不传则接续上次看的集
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [auto, direct, transcode]
+            default: auto
+          description: "`direct` = 别管能不能播，给我原文件（用户手选\"原画直连\"）"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlayInfo"
+        "403":
+          description: "`EXTERNAL_STREAM_DISABLED`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /play/{mediaId}/capability:
+    get:
+      tags: [D. 播放]
+      operationId: getCapability
+      summary: 可选的自检（非门禁）
+      description: |
+        **禁止出现在起播路径上。** 只允许两个调用时机：
+        ① 播放已开始后静默预取；② 用户在设置面板打开时。
+
+        `canDirectPlay` 允许 `null`（未验证）——这是契约级地承认探测不可靠：
+        31 屏的报错发生在 1:42:18，说明起播成功、播了一小时四十二分才崩，
+        任何请求前探测都预言不了。客户端**不得**据 `null` 或 `false` 阻断播放。
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - name: deviceId
+          in: query
+          schema: { type: string }
+          description: 默认当前设备
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Capability"
+
+  /play/{sessionId}/error:
+    post:
+      tags: [D. 播放]
+      operationId: reportPlaybackError
+      summary: 上报失败，换诊断
+      description: |
+        31/32 屏的数据源。客户端在 mpv `END_FILE` with error /
+        `AVPlayerItem.status == .failed` 时调用。
+
+        `positionMs` 是"先播再报错"的核心证据：`0` ≈ 起播即败（32 屏），
+        `6138000` = 播到 1:42:18 才断（31 屏）。服务端据此回 `failedAtMs`，
+        客户端用 `failedAtMs < 5000` 决定标题用哪一版文案。
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaybackErrorRequest"
+      responses:
+        "200":
+          description: 诊断包
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Diagnosis"
+
+  /play/fallback:
+    post:
+      tags: [D. 播放]
+      operationId: applyFallback
+      summary: 执行降级 → 新会话（凭据二选一）
+      description: |
+        HLS 边转边播，第一个分片好了就能播，**不是"转完再播"**。
+        `ready: false` 时客户端显示加载态，靠 WS `task.progress`（`id == jobId` 且
+        `firstSegmentReady: true`）或 `GET /play/{newSessionId}` 轮询（1s × 最多 30 次）。
+
+        **v1.1**：路径从 `/play/{sessionId}/fallback` 改为 `/play/fallback`，`sessionId`
+        挪进 body 与 `diagnosisId` 二选一。31/32 屏是可停留界面，用户犹豫两分钟后
+        `ps_` 已被 90 秒掉线回收；而降级所需信息（失败点、目标画质、源参数）诊断包里全有。
+
+        凭据解析：`sessionId` 有效 → `revivedFrom: session`；否则 `diagnosisId` 有效 →
+        `revivedFrom: diagnosis`；都失效 → `404 SESSION_GONE`；都没给 → `400 MISSING_CREDENTIAL`。
+
+        `resumeFromMs` 向下对齐到分片边界（6138000 → 1534 段 → 6136000），
+        客户端必须用 `playback.actualStartMs` 校正进度条，否则每次降级累积 0–4 秒漂移。
+
+        幂等：同凭据 + 同 `actionId` 重复调用返回同一新会话（不新建转码任务）。
+
+        **并发（硬约束）**：转码器只跑 **1 路**，直连不受限。
+        NAS 上第二路转码会和第一路抢 CPU，结果是两个人都卡——比排队更糟。
+
+        准入线 `maxWaitMs = 60000`：
+        - 估等 ≤ 60s → `202`，`queuePosition > 0` 时客户端显示
+          「前面有 {queuePosition} 部在转码，约 {estStartMs} 后开始」，而不是 8 秒加载态。
+        - 估等 > 60s → `409 TRANSCODER_BUSY`，`detail` 给
+          `{queuePosition, estWaitMs, maxWaitMs}`，`retryable: true`。
+          同时诊断包的 `actions[]` 里 `download` 排到首位——离线下载比干等更实际。
+        - 排队中的会话同样受 `expiresAt` 约束，超时未起播则回收，客户端需重试。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FallbackRequest"
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FallbackResult"
+        "400":
+          description: "`MISSING_CREDENTIAL` — `sessionId` 与 `diagnosisId` 都没给"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "`DIAGNOSIS_DEVICE_MISMATCH` — 诊断包不属于当前设备"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "`SESSION_GONE` — 两个凭据都失效"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: |
+            `NO_SUCH_ACTION` — `actionId` 不在诊断包里。
+            `TRANSCODER_BUSY` — 估等超过 `maxWaitMs`（60s），`detail` 含
+            `{queuePosition, estWaitMs, maxWaitMs}`，`retryable: true`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: "`DIAGNOSIS_EXPIRED` — 诊断包超过 30 分钟 TTL，`detail.diagnosisExpiresAt` 给出时刻"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: "`UNSUPPORTED_OVERRIDE`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /play/{sessionId}/progress:
+    put:
+      tags: [D. 播放]
+      operationId: reportProgress
+      summary: 进度回写
+      description: |
+        每 10 秒或暂停/退出时上报。`progressToken` 不匹配 → `409 STALE_PROGRESS`，
+        客户端应重新取 `GET /play/{mediaId}`（多端并发以最后写入为准，但拒绝乱序回写）。
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProgressUpdate"
+      responses:
+        "204":
+          description: 已记录
+        "409":
+          description: "`STALE_PROGRESS`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /play/{sessionId}/stop:
+    post:
+      tags: [D. 播放]
+      operationId: stopPlayback
+      summary: 结束会话
+      description: 释放转码资源。掉线 90 秒服务端也会自动 stop。
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                positionMs: { type: integer, minimum: 0 }
+                completed: { type: boolean, default: false }
+      responses:
+        "204":
+          description: 已结束
+
+  /play/{sessionId}/rendition:
+    put:
+      tags: [D. 播放]
+      operationId: switchRendition
+      summary: 画质切换
+      description: "仅在 `mode: transcode` 时可用；`direct` 下 → `409 NOT_TRANSCODING`。"
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [height]
+              properties:
+                height: { type: integer, enum: [2160, 1080, 720] }
+      responses:
+        "202":
+          description: 已切换
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionId, playback]
+                properties:
+                  sessionId: { type: string }
+                  playback: { $ref: "#/components/schemas/HlsPlayback" }
+        "409":
+          description: "`NOT_TRANSCODING`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ============================================================ E. 设置
+  /settings/metadata:
+    get:
+      tags: [E. 设置]
+      operationId: getMetadataSettings
+      summary: 元数据源配置与状态
+      description: |
+        一次返回 07 屏「元数据源」区需要的全部内容：语言、凭据状态、连接状态、代理、缓存占用、署名原文。
+
+        **凭据永不回传**，只给 `configured` + `kind` + 末四位 `hint`。
+        **`credential` 与 `connection` 必须分开看**："填了 key" 和 "连得上" 是两件事——
+        国内家宽上 `api.themoviedb.org` 常被 DNS 污染，key 完全正确却连不上，
+        而两者的修复动作完全不同（换 key vs 配代理）。
+
+        `attribution.text` 是条款原文，由服务端下发以保证 README / 设置页 / 关于页三处逐字一致，
+        客户端不得改写、翻译或截断。
+      parameters:
+        - name: probe
+          in: query
+          schema: { type: boolean, default: false }
+          description: |
+            `true` = 真打一次 `/3/configuration` 刷新 `connection`（约 0.6s）。
+            `false` = 返回最近一次探测结果，**不产生任何网络请求**（07 屏首屏默认用它）。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataSettings"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    put:
+      tags: [E. 设置]
+      operationId: updateMetadataSettings
+      summary: 改语言 / 凭据 / 代理 / TTL（部分更新）
+      description: |
+        写入前**先真打一次 `/3/configuration` 验证凭据**，验证失败则整体不写入并返回 422。
+        理由：先存再后台校验的话，用户看到"已保存"，十分钟后海报全线消失，
+        再回头才发现 key 是错的——失败必须发生在用户还停留在这个页面上的时候。
+
+        返回体与 GET 完全相同（含实时 `connection`），客户端保存后不必再 GET 一次。
+
+        **换 `language` 不触发全库同步重抓**：缓存按 `(tmdb_id, language)` 索引，
+        旧语言的 payload 视为 miss，后台渐进重抓、不阻塞任何界面。
+        按实测 p50 647ms × 每条 3 次请求，5 万文件同步重刮是 27 小时。
+        有刮削任务在跑时返回 `409 SCRAPE_IN_PROGRESS`，由用户决定等还是停。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMetadataSettingsRequest"
+      responses:
+        "200":
+          description: 已保存并返回最新状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataSettings"
+        "400":
+          description: "`VALIDATION_FAILED`（如 `tmdbToken` 与 `clearToken` 同时给）"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: |
+            `TMDB_CREDENTIAL_INVALID`（`detail.reason` = `unauthorized` | `network`）或
+            `TTL_EXCEEDS_POLICY`（`detail.maxTtlDays` = 180）。**配置不写入。**
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "`SCRAPE_IN_PROGRESS`（`detail.taskId`）"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /tmdb/cache:
+    delete:
+      tags: [E. 设置]
+      operationId: clearTmdbCache
+      summary: 清空元数据缓存（不清匹配）
+      description: |
+        **清缓存不清匹配**：`media.tmdb_id`、季集号、以及用户手动确认过的记录全部保留，
+        只删 payload 缓存与（可选的）本地海报文件。
+        否则一次"清空缓存"会把整库打回未匹配，用户几周手工理好的结果一夜清零。
+
+        条款要求缓存不超过 6 个月且在授权终止时清除全部内容，这个端点就是那个落点。
+        清空后下一轮扫描会重新抓全部元数据，客户端必须提前说明"海报与简介会暂时消失"。
+      parameters:
+        - name: scope
+          in: query
+          schema:
+            type: string
+            enum: [all, posters, metadata]
+            default: all
+          description: "`posters` 只删本地图片、不动 payload；`metadata` 反之"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deletedItems, deletedPosters, freedBytes]
+                properties:
+                  deletedItems: { type: integer }
+                  deletedPosters: { type: integer }
+                  freedBytes: { type: integer }
+        "409":
+          description: "`SCRAPE_IN_PROGRESS`（`detail.taskId`）——有刮削任务在跑时不许清"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+
+  securitySchemes:
+    deviceToken:
+      type: apiKey
+      in: header
+      name: X-Lumen-Device
+      description: |
+        配对时一次性下发的设备 token（32 字节 base62）。服务端由 token 反查 `deviceId`，
+        **不信任请求体里自报的设备标识**。
+        未认证 → `401 UNAUTHORIZED`；已撤销 → `401 DEVICE_REVOKED`（客户端清状态回配对页）。
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: 资源 id（ULID 带类型前缀）
+    MediaId:
+      name: mediaId
+      in: path
+      required: true
+      schema: { type: string, pattern: "^md_" }
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: { type: string, pattern: "^ps_" }
+      description: 播放会话 id（`ps_` 前缀）
+    Status:
+      name: status
+      in: query
+      schema:
+        $ref: "#/components/schemas/UnmatchedStatus"
+      description: 对应 28 屏顶部三个 tab
+    MediaTypeFilter:
+      name: mediaType
+      in: query
+      schema:
+        $ref: "#/components/schemas/MediaType"
+    SortUnmatched:
+      name: sort
+      in: query
+      schema:
+        type: string
+        enum: [confidence_asc, confidence_desc, name_asc, mtime_desc]
+        default: confidence_asc
+      description: 设计稿默认为 `confidence_asc`（按匹配度从低到高）
+    Query:
+      name: q
+      in: query
+      schema: { type: string, maxLength: 200 }
+      description: 文件名子串，服务端走 FTS5 前缀匹配
+    LibraryId:
+      name: libraryId
+      in: query
+      schema: { type: string }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: 不透明 base64，客户端不得解析；空表示第一页
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string, minLength: 8, maxLength: 128 }
+      description: 24h 内同 key 同 body 返回首次结果；同 key 不同 body → `409 IDEMPOTENCY_CONFLICT`
+
+  responses:
+    Unauthorized:
+      description: "`UNAUTHORIZED` / `DEVICE_REVOKED`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: "`FORBIDDEN` / `CANNOT_MODIFY_SELF`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: "`NOT_FOUND`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: "`CONFLICT`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    MetadataSourceUnavailable:
+      description: "`METADATA_SOURCE_UNAVAILABLE` — TMDB 不可达（无外网且未配代理），retryable"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+
+    # ------------------------------------------------------------------ 通用
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId, retryable]
+          properties:
+            code:
+              type: string
+              description: 大写下划线枚举，**客户端按 code 分支，不解析 message**
+              examples: [TASK_NOT_FOUND, EPISODE_OUT_OF_RANGE, STALE_PROGRESS]
+            message:
+              type: string
+              description: 英文短句，只进日志
+            detail:
+              type: [object, "null"]
+              description: 结构化上下文，字段随 code 变
+              additionalProperties: true
+            requestId:
+              type: string
+              description: 回显 `X-Lumen-Request-Id`，没有则服务端生成
+            retryable:
+              type: boolean
+              description: 客户端可据此决定是否显示"重试"
+
+    # ------------------------------------------------------------------ A. 媒体整理
+    UnmatchedStatus:
+      type: string
+      enum: [pending, matched, ignored]
+      description: |
+        `pending` 待确认 / `matched` 已匹配 / `ignored` 已忽略。
+        状态机单向：`pending --match--> matched`，`pending --ignore--> ignored`（可带 TTL 回归）。
+
+    MediaType:
+      type: string
+      enum: [unknown, ambiguous, movie, episode, music, photo]
+      description: |
+        `unknown` 类型判不出；`ambiguous` 多个类型都像（UI 显示"歧义"）；
+        其余为已判定类型。
+
+    UnmatchedReasonCode:
+      type: string
+      enum:
+        - EPISODE_WITHOUT_SERIES
+        - YEAR_OR_TITLE_AMBIGUOUS
+        - TITLE_YEAR_OVERLAP
+        - YEAR_IS_RELEASE_TAG
+        - STRONG_MATCH
+        - NEAR_DUPLICATE
+        - MULTI_SEASON_PACK
+        - MUSIC_NO_FINGERPRINT
+        - PHOTO_NO_EXIF
+      description: |
+        驱动 28 屏每行副标文案，客户端查本地文案表渲染。
+
+        | code | `reasonParams` | 渲染示例 |
+        |---|---|---|
+        | EPISODE_WITHOUT_SERIES | `{season, episode, candidates}` | 文件名里没有剧名，无法确定属于哪个系列 |
+        | YEAR_OR_TITLE_AMBIGUOUS | `{token}` | 「2012」既是年份也是片名，无法判断该用哪个 |
+        | TITLE_YEAR_OVERLAP | `{guessedTitle, guessedYear, matchedTitle, matchedYear, overlap}` | 疑似「霓虹灯牌」2025 · 英文名与片库记录部分重合 |
+        | YEAR_IS_RELEASE_TAG | `{title, year, bracketYear}` | 括号里的 2019 是压制年份，不是上映年 |
+        | STRONG_MATCH | `{title, year, score}` | 匹配「海的另一边」2023 · 片名与年份都吻合 |
+        | NEAR_DUPLICATE | `{title, year, existingQuality}` | 片库中已有一部 1080p 版本 |
+
+        新增 code 必须同步客户端文案表；客户端遇到未知 code 降级显示 `fileName`，不得白屏。
+
+    ParsedName:
+      type: object
+      description: 文件名解析结果，供右栏"已识别"提示与调试
+      properties:
+        title: { type: [string, "null"] }
+        year: { type: [integer, "null"] }
+        season: { type: [integer, "null"] }
+        episode: { type: [integer, "null"] }
+        resolution:
+          type: [string, "null"]
+          examples: [2160p, 1080p, 720p]
+        source:
+          type: [string, "null"]
+          examples: [WEB-DL, BluRay, HDTV]
+        releaseGroup:
+          type: [string, "null"]
+          examples: ["[SubsPlease]"]
+
+    Probe:
+      type: object
+      description: ffprobe 结果；探测失败（损坏文件常见）时整个对象为 null
+      properties:
+        durationMs: { type: integer, minimum: 0 }
+        container:
+          type: string
+          examples: [matroska, mp4, avi]
+        width: { type: integer }
+        height: { type: integer }
+        videoCodec:
+          type: string
+          description: ffprobe 原始 codec 名小写
+          examples: [hevc, h264, av1]
+        audioCodec:
+          type: string
+          examples: [eac3, aac, dts]
+        ok: { type: boolean, default: true }
+
+    UnmatchedItem:
+      type: object
+      required:
+        - id
+        - fileName
+        - relPath
+        - libraryId
+        - sizeBytes
+        - mtime
+        - mediaType
+        - status
+        - confidence
+        - reasonCode
+        - reasonParams
+        - parsed
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: "^um_"
+        fileName:
+          type: string
+          maxLength: 512
+          description: 纯文件名，含扩展名
+        relPath:
+          type: string
+          description: 相对媒体库根的路径，用于右栏"路径"行与去重
+        libraryId: { type: string }
+        sizeBytes: { type: integer, format: int64 }
+        mtime:
+          type: string
+          format: date-time
+          description: 文件修改时间，不是扫描时间
+        mediaType:
+          $ref: "#/components/schemas/MediaType"
+        status:
+          $ref: "#/components/schemas/UnmatchedStatus"
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: |
+            **`0` 表示未识别**，客户端显示「未识别」而非「0%」；`>0` 显示 `round(x*100)%`。
+        reasonCode:
+          $ref: "#/components/schemas/UnmatchedReasonCode"
+        reasonParams:
+          type: object
+          additionalProperties: true
+        thumbUrl:
+          type: [string, "null"]
+          format: uri
+          description: 已生成缩略图的直链（带签，TTL 24h）；`null` → 客户端画问号占位（28 屏首行）
+        parsed:
+          $ref: "#/components/schemas/ParsedName"
+        probe:
+          oneOf:
+            - $ref: "#/components/schemas/Probe"
+            - type: "null"
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Counts:
+      type: object
+      required: [pending, matched, ignored]
+      properties:
+        pending: { type: integer }
+        matched: { type: integer }
+        ignored: { type: integer }
+
+    UnmatchedList:
+      type: object
+      required: [items, nextCursor, total, counts, countsAsOf]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/UnmatchedItem" }
+        nextCursor:
+          type: [string, "null"]
+          description: "`null` 表示没有下一页"
+        total:
+          type: integer
+          description: 当前筛选条件下的总数（可能随扫描变化）
+        counts:
+          $ref: "#/components/schemas/Counts"
+        countsAsOf:
+          type: string
+          format: date-time
+          description: |
+            `counts` 的取样时刻。当前实现等于响应生成时刻（无缓存）。
+            客户端若发现它比 `lastScanAt` 早，可提示计数可能已变。
+        lastScanAt:
+          type: [string, "null"]
+          format: date-time
+          description: 驱动页头「上次扫描 8 分钟前」
+        scanInProgress: { type: boolean }
+
+    CandidateBasis:
+      type: object
+      required: [code, params]
+      properties:
+        code:
+          type: string
+          enum: [SAME_SEASON_RECENT_SCAN, FILENAME_TOKENS, FINGERPRINT, NONE]
+          description: "`SAME_SEASON_RECENT_SCAN` 驱动提示条「缺剧名。已按最近扫描到的同季剧集给出候选」"
+        params:
+          type: object
+          additionalProperties: true
+          description: "渲染提示条用的数字，如 `{season: 2, seriesCount: 3}`"
+
+    Candidate:
+      type: object
+      required: [tmdbId, mediaType, title, originalTitle, inLibrary, score, recommended]
+      properties:
+        tmdbId: { type: integer }
+        mediaType:
+          type: string
+          enum: [movie, tv]
+        title:
+          type: string
+          description: |
+            TMDB 标题，按库设置的 language 取。**无该语言译名时返回 originalTitle 本身**
+            （实测回退链是 zh-CN → 原名，**不经过英文**），所以这里可能是韩文/日文/英文，
+            客户端不得假设含中文。
+        originalTitle: { type: string }
+        year: { type: [integer, "null"] }
+        posterUrl:
+          type: [string, "null"]
+          format: uri
+          description: 已代理到本机，避免客户端直连 TMDB（外网不可达时也要能显示）
+        overview: { type: [string, "null"] }
+        seasonNumber:
+          type: [integer, "null"]
+          description: "**仅当候选能落到具体集时给**，驱动「第 2 季第 4 集《失重》」"
+        episodeNumber: { type: [integer, "null"] }
+        episodeTitle:
+          type: [string, "null"]
+          description: 驱动《失重》
+        totalSeasons: { type: [integer, "null"] }
+        totalEpisodes:
+          type: [integer, "null"]
+          description: 驱动「2022 · 第 1 季 · 12 集」
+        inLibrary:
+          type: boolean
+          description: 已在库内，客户端标「已在库」避免重复添加
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: |
+            服务端排序依据，客户端不显示。产生规则（按权重）：
+            标题 token 覆盖率（**不是字符串相等**——中文译名常比俗称长，如「昼颜」在 TMDB 的
+            zh-CN 名是「昼颜：工作日下午3点的恋人们」，用相等判定会把正确答案判成未匹配）；
+            年份 ±1 年；类型与文件名季集号是否一致；原名语言是否与文件名语言一致。
+            popularity **只能做同分时的次序**：两字短标题会被综艺抢占（「信号」top1 是
+            「心动的信号」恋爱综艺，正确项在 rank 2）。长度差异**不得**作为降权理由。
+        recommended:
+          type: boolean
+          description: 驱动右上「推荐」角标；**最多 1 个为 true**
+        recommendBasis:
+          type: [string, "null"]
+          enum: [SAME_SERIES, SAME_SEASON, EPISODE_TITLE_MATCH, null]
+
+    CandidateList:
+      type: object
+      required: [itemId, basis, items]
+      properties:
+        itemId: { type: string }
+        basis:
+          $ref: "#/components/schemas/CandidateBasis"
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Candidate" }
+        total: { type: integer }
+
+    TmdbSearchResult:
+      type: object
+      required: [query, resolvedBy, items]
+      properties:
+        query: { type: string }
+        resolvedBy:
+          type: string
+          enum: [title, tmdb_id, none]
+          description: "`none` 时 `items: []`，客户端显示空态而非错误"
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Candidate" }
+        total: { type: integer }
+
+    MatchRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          type: object
+          required: [tmdbId, mediaType]
+          properties:
+            tmdbId: { type: integer }
+            mediaType:
+              type: string
+              enum: [movie, tv]
+            seasonNumber:
+              type: integer
+              description: "`mediaType: tv` 时必需"
+            episodeNumber:
+              type: integer
+              description: "`mediaType: tv` 时必需"
+        applyToSiblings:
+          type: boolean
+          default: false
+          description: |
+            把**同目录下同季**的其余文件按季集号一起绑定。
+            `S02E04` 旁边的 E05–E12 靠这个一次搞定。
+        regenerateThumb:
+          type: boolean
+          default: true
+          description: 触发缩略图重生成（设计稿脚注承诺了这点）
+        moveToLibrary:
+          type: boolean
+          default: true
+          description: 从 `未整理/` 移到规范路径；`false` 则原地登记
+
+    MatchResponse:
+      type: object
+      required: [mediaId, status, title, affectedMediaIds, affectedCount, thumbPending]
+      properties:
+        mediaId: { type: string, pattern: "^md_" }
+        status:
+          type: string
+          const: matched
+        title: { type: string }
+        episodeTitle: { type: [string, "null"] }
+        affectedMediaIds:
+          type: array
+          items: { type: string }
+          description: 含自身；`applyToSiblings` 时的全部
+        affectedCount: { type: integer }
+        taskId:
+          type: [string, "null"]
+          description: "缩略图/入库任务 id；`thumbPending: false` 时为 null"
+        thumbPending: { type: boolean }
+
+    IgnoreRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          enum: [noise, wrong_library, duplicate, unsupported, other]
+          default: other
+        note:
+          type: [string, "null"]
+          maxLength: 200
+          description: 仅内部可见
+        ttlDays:
+          type: [integer, "null"]
+          default: null
+          minimum: 1
+          maximum: 3650
+          description: |
+            `null` = 永久（默认，一期唯一可达值）。>0 = N 天后自动回归 `pending`。
+            服务端必须接受该字段，即使一期客户端不传；返回的 `expiresAt` 与之对应。
+
+    IgnoreResponse:
+      type: object
+      required: [id, status, ignoredAt]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          const: ignored
+        ignoredAt: { type: string, format: date-time }
+        expiresAt: { type: [string, "null"], format: date-time }
+
+    BatchMatchRequest:
+      type: object
+      properties:
+        threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.9
+          description: 只处理 `confidence >= threshold` 的项
+        dryRun:
+          type: boolean
+          default: false
+          description: 只返回将被处理的数量与预估，不写库（给二次确认用）
+        libraryId: { type: [string, "null"] }
+        ids:
+          type: [array, "null"]
+          items: { type: string }
+          description: "`null` = 全库按 threshold"
+
+    BatchMatchResponse:
+      type: object
+      required: [dryRun, candidateCount, estimatedMs, accepted, skipped]
+      properties:
+        taskId:
+          type: [string, "null"]
+          description: "`dryRun: true` 时为 null"
+        dryRun: { type: boolean }
+        candidateCount: { type: integer }
+        estimatedMs: { type: integer }
+        accepted: { type: integer }
+        skipped: { type: integer }
+
+    # ------------------------------------------------------------------ B. 任务
+    TaskKind:
+      type: string
+      enum:
+        - library_scan
+        - metadata_fetch
+        - thumbnail_gen
+        - subtitle_fetch
+        - music_match
+        - media_move
+        - transcode
+        - batch_match
+
+    TaskState:
+      type: string
+      enum: [queued, running, paused, succeeded, failed, canceled]
+      description: |
+        ```
+        queued ──▶ running ──▶ succeeded
+          ▲          │  │
+          │          │  └──▶ failed ──retry──▶ queued
+          └─resume── paused
+                     └────▶ canceled
+        ```
+
+    TaskUnit:
+      type: string
+      enum: [file, photo, episode, album, frame, item]
+      description: 客户端映射中文量词（张/集/张专辑/项）
+
+    TaskTarget:
+      type: object
+      properties:
+        libraryId: { type: [string, "null"] }
+        displayPath:
+          type: [string, "null"]
+          description: |
+            **仅用于展示**的库根路径，驱动副行 `D:/Media/photos`。
+            会随盘符/挂载点变化（Windows 上 `D:` 拔插后可能变 `E:`），**不得用于寻址**——
+            寻址一律用 `libraryId`。之所以还要给，是因为用户在 29 屏需要认出"这是哪个目录"。
+        fileCount:
+          type: [integer, "null"]
+          description: 驱动副行 `12,480 个文件`；扫描前未知为 null
+        sizeBytes:
+          type: [integer, "null"]
+          format: int64
+          description: 驱动 `4.2 TB`
+
+    TaskProgress:
+      type: object
+      required: [done, percent, indeterminate]
+      properties:
+        done: { type: integer }
+        total:
+          type: [integer, "null"]
+          description: "`null` 时 `indeterminate: true`（扫描第一遍不知道总数）"
+        unit:
+          $ref: "#/components/schemas/TaskUnit"
+        percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: 服务端算好的整数；`indeterminate` 时为 0
+        ratePerSec:
+          type: [number, "null"]
+          description: 驱动「42 张/秒」；<1 时客户端显示小数
+        etaMs:
+          type: [integer, "null"]
+          description: 驱动「剩余约 1 分 35 秒」；波动大，客户端做 3 次滑动平均再显示
+        indeterminate: { type: boolean }
+
+    TaskResult:
+      type: object
+      required: [code, params]
+      properties:
+        code:
+          type: string
+          enum: [SCAN_DONE, MATCH_DONE, THUMB_DONE, NO_CHANGE, PARTIAL]
+        params:
+          type: object
+          additionalProperties: true
+          description: 数字，驱动「12,480 张 · 新增 136 张」「匹配 46 部 · 2 项待确认」「无变化」
+
+    NeedsAttention:
+      type: object
+      required: [code, target]
+      properties:
+        code:
+          type: string
+          examples: [UNMATCHED_ITEMS]
+        params:
+          type: object
+          additionalProperties: true
+        target:
+          type: object
+          description: 点击「需处理 ›」的跳转目标
+          additionalProperties: true
+          examples:
+            - { route: unmatched, filter: { status: pending } }
+
+    TaskError:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          enum: [IO_ERROR, PERMISSION_DENIED, SOURCE_UNAVAILABLE, DISK_FULL, CANCELED, INTERNAL]
+        message: { type: string }
+        detail:
+          type: [object, "null"]
+          additionalProperties: true
+
+    Task:
+      type: object
+      required: [id, kind, title, state, target, progress]
+      properties:
+        id: { type: string, pattern: "^tk_" }
+        kind:
+          $ref: "#/components/schemas/TaskKind"
+        title:
+          type: string
+          description: |
+            任务名**是内容**，服务端给中文短名（"扫描照片库"）。
+            这是"服务端只给数字"规则的例外之一。
+        state:
+          $ref: "#/components/schemas/TaskState"
+        target:
+          $ref: "#/components/schemas/TaskTarget"
+        progress:
+          $ref: "#/components/schemas/TaskProgress"
+        queuePosition:
+          type: integer
+          minimum: 1
+          description: 仅 `queued`
+        etaMs:
+          type: integer
+          description: |
+            排队预计等待，仅 `queued`。
+            **必须把 running 的剩余时间算进去**——29 屏第二行「约 4 分钟」含了前面 12 秒 + 当前任务的 1 分 35 秒。
+        estReason:
+          type: [string, "null"]
+          enum: [LAST_RUN, HEURISTIC, null]
+          description: LAST_RUN 按上次耗时估 / HEURISTIC 按文件数估
+        priority:
+          type: integer
+          default: 100
+          description: 越小越前；置顶 = 0
+        startedAt: { type: [string, "null"], format: date-time }
+        finishedAt: { type: [string, "null"], format: date-time }
+        durationMs:
+          type: [integer, "null"]
+          description: 仅已结束任务；驱动「4 分 12 秒」
+        canPause:
+          type: boolean
+          description: "**按钮可用性由服务端决定**，客户端不自己判断 kind（`media_move` 不可暂停）"
+        canCancel: { type: boolean }
+        canRetry: { type: boolean }
+        pauseRequestedAt:
+          type: [string, "null"]
+          format: date-time
+          description: 非 null 表示暂停已请求、尚未在 checkpoint 停下 → UI 显示"正在暂停…"并禁用按钮
+        result:
+          oneOf:
+            - $ref: "#/components/schemas/TaskResult"
+            - type: "null"
+        needsAttention:
+          oneOf:
+            - $ref: "#/components/schemas/NeedsAttention"
+            - type: "null"
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/TaskError"
+            - type: "null"
+
+    TaskSummary:
+      type: object
+      required: [runningCount, queuedCount]
+      properties:
+        runningCount: { type: integer }
+        queuedCount: { type: integer }
+        succeeded7d:
+          type: integer
+          description: 驱动「最近 7 天完成 14 个」
+        failed7d: { type: integer }
+
+    Schedule:
+      type: object
+      required: [enabled, cron, nextRunAt]
+      properties:
+        enabled: { type: boolean }
+        cron:
+          type: string
+          default: "0 3 * * *"
+          description: 五段式
+        timezone:
+          type: string
+          default: Asia/Shanghai
+          description: IANA 名
+        nextRunAt:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            驱动「下次 3 小时 27 分后」。**必须由服务端算**——
+            客户端算 cron 会和夏令时/时区打架。
+        lastCheckedAt: { type: [string, "null"], format: date-time }
+        skipIfNoChange:
+          type: boolean
+          default: true
+          description: 无新文件则跳过不记入 recent（"只在检测到新文件时运行"）
+        notifyOnComplete: { type: boolean, default: false }
+
+    ScheduleUpdate:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        cron: { type: string }
+        timezone: { type: string }
+        skipIfNoChange: { type: boolean }
+        notifyOnComplete: { type: boolean }
+
+    TasksScreen:
+      type: object
+      required: [queued, recent, summary, schedule]
+      properties:
+        running:
+          oneOf:
+            - $ref: "#/components/schemas/Task"
+            - type: "null"
+        queued:
+          type: array
+          items: { $ref: "#/components/schemas/Task" }
+        recent:
+          type: array
+          items: { $ref: "#/components/schemas/Task" }
+        summary:
+          $ref: "#/components/schemas/TaskSummary"
+        schedule:
+          $ref: "#/components/schemas/Schedule"
+
+    CreateTaskRequest:
+      type: object
+      required: [kind, target]
+      properties:
+        kind:
+          $ref: "#/components/schemas/TaskKind"
+        target:
+          type: object
+          properties:
+            libraryId:
+              type: string
+              description: 扫描类任务必填；**寻址的唯一依据**
+            relPath:
+              type: string
+              description: |
+                单文件任务的**库内相对路径**（`/` 分隔、不含盘符、不以 `/` 开头）。
+                **不得传绝对路径**：盘符会变，服务端寻址走 `volume_id + rel_path`，
+                传绝对路径直接 `422 ABSOLUTE_PATH_NOT_ALLOWED`。
+        options:
+          type: object
+          additionalProperties: true
+          examples:
+            - { full: false, generateThumbs: true }
+        priority: { type: integer, default: 100 }
+        dedupe:
+          type: boolean
+          default: true
+          description: 同 kind+target 已在队列/运行 → `409 TASK_EXISTS` + `detail.existingTaskId`
+
+    TaskActionAccepted:
+      type: object
+      required: [id, state, requested]
+      properties:
+        id: { type: string }
+        state:
+          $ref: "#/components/schemas/TaskState"
+          description: "**202 时仍是 running**，真 paused 由 WS `task.state` 给"
+        requested:
+          type: string
+          enum: [pause, resume, cancel]
+        pauseRequestedAt: { type: [string, "null"], format: date-time }
+        cancelRequestedAt: { type: [string, "null"], format: date-time }
+
+    WsEvent:
+      type: object
+      description: |
+        WebSocket 帧统一 envelope。客户端只按 `type` 分发，
+        发现 `seq` 跳跃时主动 `GET /tasks` 校正（不要试图补帧）。
+      required: [v, seq, ts, type, payload]
+      properties:
+        v: { type: integer, const: 1 }
+        seq:
+          type: integer
+          description: 单调递增、按连接全局唯一
+        ts: { type: string, format: date-time }
+        type:
+          type: string
+          enum:
+            - snapshot
+            - task.created
+            - task.progress
+            - task.state
+            - task.finished
+            - task.removed
+            - device.added
+            - device.updated
+            - device.removed
+            - schedule.updated
+            - summary.updated
+            - heartbeat
+          description: |
+            客户端按 `type` 分发。**未知类型必须忽略，不得断开连接**——
+            这正是 `device.*` 能在 v1.1 无痛加进来的原因。
+        payload:
+          type: object
+          additionalProperties: true
+          description: |
+            | type | payload | 说明 |
+            |---|---|---|
+            | snapshot | `{tasks: TasksScreen, devices: Device[]}` | 连接即发一次，全量替换两个 store |
+            | task.created | `{task}` | |
+            | task.progress | `{id, progress, ratePerSec, etaMs, firstSegmentReady?}` | 节流 500ms 或 percent ≥1，**不落库**。`firstSegmentReady` 仅转码任务给，变化时**跳过节流立即推** |
+            | task.state | `{id, state, startedAt, finishedAt, pauseRequestedAt, canPause, canCancel}` | |
+            | task.finished | `{id, state, durationMs, result, needsAttention, error}` | |
+            | task.removed | `{id}` | |
+            | device.added | `{device: Device}` | 配对成功，30 屏插入卡片 |
+            | device.updated | `{device: Device}` | 按 `id` 覆盖；**不含在线态**，只在持久属性变化时发 |
+            | device.removed | `{id}` | 撤销访问 |
+            | schedule.updated | `{schedule}` | |
+            | summary.updated | `{summary}` | 节流 2s |
+            | heartbeat | `{}` | 每 15s；45s 无帧则客户端重连 |
+
+    # ------------------------------------------------------------------ C. 设备
+    DeviceKind:
+      type: string
+      enum: [desktop, mobile, tablet, tv, web]
+      description: 驱动卡片左侧单字图标（桌/手/平/视）
+
+    DevicePermission:
+      type: string
+      enum: [play, manage_library, manage_devices]
+      description: |
+        三个**并列**能力位，互不隐含——`manage_devices` 不自动带来 `play`。
+        服务端逐项校验，不做"高级别包含低级别"的推导。
+
+        | 值 | 允许 |
+        |---|---|
+        | `play` | 播放、上报进度、拖拽/换音轨 |
+        | `manage_library` | 删片、改元数据、触发匹配与忽略、发起扫描 |
+        | `manage_devices` | 生成配对码、撤销设备、改他人权限 |
+
+        新设备默认 `["play"]`。空数组 = 只能看进度，不能操作。
+        拆三级的理由：客厅电视要能播、绝不该能删片；手机丢了一键撤销不该顺带丢失片库管理权。
+
+    DeviceActivity:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [playing, paused, idle]
+          description: "`idle` 时整个 `activity` 为 null"
+        mediaTitle: { type: [string, "null"] }
+        positionMs: { type: [integer, "null"] }
+        startedAt: { type: [string, "null"], format: date-time }
+
+    LastActivitySummary:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [played, finished, opened, paired]
+          description: |
+            `played` 上次播放到 X（驱动「上次播放「潮汐」至 1:24」）/
+            `finished` 看完（驱动「看完「北方旅店」第 3 集」）/
+            `opened` 只看未播 / `paired` 刚配对
+        title: { type: [string, "null"] }
+        positionMs:
+          type: [integer, "null"]
+          description: 时间码由客户端格式化，服务端只给毫秒
+
+    Device:
+      type: object
+      required: [id, name, kind, platform, isSelf, online, network, permissions]
+      properties:
+        id: { type: string, pattern: "^dev_" }
+        name:
+          type: string
+          description: 设备名**是内容**，服务端存配对时上报的名字，可被 PATCH 改名
+        kind:
+          $ref: "#/components/schemas/DeviceKind"
+        platform:
+          type: string
+          enum: [macos, ios, ipados, tvos, windows, linux, android, web]
+        platformVersion: { type: string }
+        appVersion:
+          type: string
+          description: 驱动「Lumen 桌面端 1.0」中的 1.0
+        isSelf:
+          type: boolean
+          description: 驱动「本机」角标 + 深色卡 + 不可撤销
+        online:
+          type: boolean
+          description: 服务端按心跳判定（`now - lastSeenAt < 90s`）
+        lastSeenAt: { type: [string, "null"], format: date-time }
+        network:
+          type: string
+          enum: [lan, tailscale, public]
+          description: 驱动「局域网 / 外网」
+        address:
+          type: [string, "null"]
+          description: 对应 network 的 IP（LAN 私有地址或 100.x）
+        permissions:
+          type: array
+          items: { $ref: "#/components/schemas/DevicePermission" }
+          description: 驱动右侧「可播放 · 可管理」
+        activity:
+          oneOf:
+            - $ref: "#/components/schemas/DeviceActivity"
+            - type: "null"
+        lastActivityAt: { type: [string, "null"], format: date-time }
+        lastActivitySummary:
+          oneOf:
+            - $ref: "#/components/schemas/LastActivitySummary"
+            - type: "null"
+        pairedAt: { type: [string, "null"], format: date-time }
+        revokedAt:
+          type: [string, "null"]
+          format: date-time
+          description: 非 null → 卡片显示「撤销访问」并置灰（30 屏 Apple TV 那张）
+
+    RemoteAccess:
+      type: object
+      required: [enabled, status, provider, publicPortsOpen]
+      properties:
+        enabled: { type: boolean }
+        status:
+          type: string
+          enum: [disabled, connecting, connected, degraded]
+          description: |
+            驱动右上 pill「已连接」。`degraded` = 通了但走 relay 中继（速度差），客户端应给黄色提示。
+        provider:
+          type: string
+          const: tailscale
+        tailnetIp:
+          type: [string, "null"]
+          description: 驱动「组网地址 100.88.4.1」；`status != connected` 时为 null
+        hostname:
+          type: [string, "null"]
+          description: 驱动「节点名 lumen-nas」
+        magicDnsName: { type: [string, "null"] }
+        lastHandshakeAt:
+          type: [string, "null"]
+          format: date-time
+          description: 驱动「上次握手 12 秒前」（客户端算相对时间）
+        peersOnline: { type: integer }
+        allowExternalStream: { type: boolean }
+        externalMaxHeight:
+          type: integer
+          enum: [720, 1080]
+          description: 驱动提示「外网播放会实时转码，最高 1080p」
+        publicPortsOpen:
+          type: boolean
+          description: 恒 false（自建保证），仅用于在 UI 上加固说明
+
+    RemoteAccessUpdate:
+      type: object
+      properties:
+        allowExternalStream: { type: boolean }
+        externalMaxHeight: { type: integer, enum: [720, 1080] }
+
+    DevicesScreen:
+      type: object
+      required: [items, summary]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Device" }
+        summary:
+          type: object
+          required: [total, online]
+          properties:
+            total: { type: integer }
+            online: { type: integer }
+            syncPlayback:
+              type: boolean
+              description: 本产品恒 true，保留字段为将来 tvOS 端不支持时能关
+        remoteAccess:
+          oneOf:
+            - $ref: "#/components/schemas/RemoteAccess"
+            - type: "null"
+
+    RevokeResult:
+      type: object
+      required: [id, revokedAt]
+      properties:
+        id: { type: string }
+        revokedAt: { type: string, format: date-time }
+        disconnectDeadline:
+          type: [string, "null"]
+          format: date-time
+          description: 若正在播放，服务端此刻强断（设计稿承诺"60 秒内断开"）
+        activePlaybackId:
+          type: [string, "null"]
+          description: 该设备当前播放会话，null 表示没在播
+
+    PairingCode:
+      type: object
+      required: [code, expiresAt, ttlSec, remainingSec, channel, pairUri]
+      properties:
+        code:
+          type: string
+          pattern: "^[0-9]{6}$"
+          description: |
+            6 位数字**字符串**（不要给 int，前导 0 会丢）。一次性，用后立即失效。
+        expiresAt: { type: string, format: date-time }
+        ttlSec: { type: integer }
+        remainingSec:
+          type: integer
+          description: 驱动「4 分 12 秒后失效」
+        channel:
+          type: string
+          enum: [lan, tailscale]
+        pairUri:
+          type: string
+          description: 给二维码用的深链，扫码即可带参
+          examples: ["lumen://pair?h=192.168.1.24&c=742916"]
+
+    PairRequest:
+      type: object
+      required: [code, device]
+      properties:
+        code: { type: string, pattern: "^[0-9]{6}$" }
+        device:
+          type: object
+          required: [name, kind, platform]
+          properties:
+            name: { type: string, maxLength: 64 }
+            kind:
+              $ref: "#/components/schemas/DeviceKind"
+            platform: { type: string }
+            platformVersion: { type: string }
+            appVersion: { type: string }
+            publicKey:
+              type: string
+              description: base64，用于后续会话签名
+
+    PairResponse:
+      type: object
+      required: [deviceToken, deviceId, endpoints, permissions]
+      properties:
+        deviceToken:
+          type: string
+          description: "**只返回这一次**，服务端只存哈希；丢了必须重新配对"
+        deviceId: { type: string }
+        serverName: { type: string }
+        serverVersion: { type: string }
+        endpoints:
+          type: object
+          description: 客户端择优连接——同网段优先 lan，失败回落 tailscale
+          properties:
+            lan: { type: [string, "null"], format: uri }
+            tailscale: { type: [string, "null"], format: uri }
+        permissions:
+          type: array
+          items: { $ref: "#/components/schemas/DevicePermission" }
+
+    # ------------------------------------------------------------------ D. 播放
+    PlaybackMode:
+      type: string
+      enum: [direct, remux, transcode]
+      description: |
+        | 值 | 做什么 | 单核速度 | 占外网转码配额 | `source.protocol` |
+        |---|---|---|---|---|
+        | `direct` | 原文件直出 | — | 否 | `http` |
+        | `remux` | **只换容器，不重编码**（`ffmpeg -c copy` → fMP4） | 10× 实时 | **否** | `hls` |
+        | `transcode` | 实时重编码 | 0.3–0.6× 实时 | **是**（1 路） | `hls` |
+
+        `remux` 不是优化项，是 iOS 播 mkv 的**唯一可行路径**：AVPlayer 打不开 matroska，
+        但重编码要 40 分钟。`-c copy` 只搬数据流，1–2 秒出首片。
+
+        **配额语义（两个上限分开算，不要合并）**：
+        - 外网转码名额：`transcode` 独占 1 路；`remux` **不占**。
+        - ffmpeg 进程池：`remux` 与 `transcode` **共享**，上限 2。
+        - 池满时 `remux` 进同一队列、但**优先级高于** transcode（只占几秒，先让它过去）。
+          因为几乎不等，`remux` 不返回 `queuePosition`，也不会产生 `TRANSCODER_BUSY`。
+
+    VideoTrack:
+      type: object
+      required: [index, codec, width, height, fps]
+      properties:
+        index: { type: integer }
+        codec:
+          type: string
+          examples: [hevc, h264, av1]
+        profile:
+          type: [string, "null"]
+          examples: ["Main 10", "High"]
+        level: { type: [number, "null"] }
+        width: { type: integer }
+        height: { type: integer }
+        fps: { type: number }
+        hdr:
+          type: [string, "null"]
+          enum: [hdr10, hlg, dolby_vision, sdr, null]
+        bitDepth:
+          type: integer
+          enum: [8, 10, 12]
+        bitrateKbps: { type: integer }
+
+    AudioTrack:
+      type: object
+      required: [index, codec, channels]
+      properties:
+        index: { type: integer }
+        codec:
+          type: string
+          examples: [eac3, aac, dts, truehd, flac]
+        channels: { type: integer }
+        channelLayout:
+          type: [string, "null"]
+          description: 驱动「国语 5.1」中的 5.1
+          examples: ["5.1", "7.1", "2.0"]
+        language:
+          type: [string, "null"]
+          description: ISO 639-2（zho/eng/jpn）
+        title:
+          type: [string, "null"]
+          examples: ["国语 5.1"]
+        default: { type: boolean }
+        bitrateKbps: { type: [integer, "null"] }
+        external: { type: boolean }
+
+    SubtitleTrack:
+      type: object
+      required: [index, codec, language, external]
+      properties:
+        index: { type: integer }
+        codec:
+          type: string
+          examples: [subrip, ass, pgs, dvdsub]
+          description: pgs/dvdsub 是图形字幕，客户端不能改样式
+        language: { type: string }
+        title: { type: [string, "null"] }
+        forced: { type: boolean }
+        external:
+          type: boolean
+          description: 外挂字幕为 true，此时 `url` 必填
+        url:
+          type: [string, "null"]
+          format: uri
+          description: 外挂字幕直链；内封为 null（由客户端从容器里取）
+
+    Rendition:
+      type: object
+      required: [height, bitrateKbps, requiresTranscode]
+      properties:
+        height: { type: integer, enum: [2160, 1080, 720] }
+        bitrateKbps: { type: integer }
+        requiresTranscode:
+          type: boolean
+          description: 决定该档是否需要切会话
+
+    PlaySource:
+      type: object
+      required: [url, protocol, container, durationMs, video, audio, subtitles]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            **带签名**，TTL 与 `expiresAt` 一致。
+            支持 Range 请求（拖动依赖它）。
+        protocol:
+          type: string
+          enum: [http, hls]
+          description: |
+            `http` = 原文件 progressive（**仅 `direct`**，支持 Range，可任意拖动）。
+            `hls` = fMP4 分片（**`transcode` 与 `remux` 都必须走这条**）。
+
+            **`remux` 不允许 `http`**：边转边出的 fMP4 没有完整 moov 索引（在末尾或只有空 moov），
+            progressive 传输下进度条**拖不动**。不写死这条，客户端会对着"拖不动"查一星期。
+        container:
+          type: string
+          examples: [matroska, mp4, fmp4]
+          description: |
+            客户端**实际拿到的**容器。`remux` / `transcode` 后为 `fmp4`；
+            原文件容器留在库里，不在响应里重复。
+        durationMs: { type: integer }
+        video:
+          $ref: "#/components/schemas/VideoTrack"
+        audio:
+          type: array
+          items: { $ref: "#/components/schemas/AudioTrack" }
+        subtitles:
+          type: array
+          items: { $ref: "#/components/schemas/SubtitleTrack" }
+
+    PlayInfo:
+      type: object
+      required: [sessionId, mediaId, title, mode, source, renditions, progressToken, expiresAt]
+      description: |
+        **不返回 `canDirectPlay`、不返回"建议转码"、不返回任何预判布尔。**
+        这个接口只回答"源在哪、有什么轨"，不回答"你能播吗"。
+      properties:
+        sessionId:
+          type: string
+          pattern: "^ps_"
+          description: 后续 error/fallback/progress 都挂它
+        mediaId: { type: string }
+        title: { type: string }
+        subtitleLine:
+          oneOf:
+            - type: object
+              required: [code, params]
+              properties:
+                code:
+                  type: string
+                  enum: [EPISODE, MOVIE, TRACK]
+                params:
+                  type: object
+                  additionalProperties: true
+                  examples:
+                    - { season: 1, episode: 3, episodeTitle: 走廊尽头 }
+            - type: "null"
+          description: 驱动顶栏「第 1 季第 3 集「走廊尽头」」
+        mode:
+          $ref: "#/components/schemas/PlaybackMode"
+        source:
+          $ref: "#/components/schemas/PlaySource"
+        resumePositionMs:
+          type: [integer, "null"]
+          description: "`resume=false` 或首次观看时为 null；驱动\"从 1:42:18 继续\""
+        renditions:
+          type: array
+          items: { $ref: "#/components/schemas/Rendition" }
+          description: |
+            24 屏「画质」档位。
+
+            **必须按本机实测能力过滤，不能返回固定三档。** 服务端启动时探测 `host_profile`
+            （见技术框架 §1.1），只有"目标分辨率下编码倍率 ≥ 1× 实时"的档位才能出现：
+
+            | 主机档 | 典型可见档位 |
+            |---|---|
+            | S（独显硬编） | 2160 / 1080 / 720 |
+            | M（桌面核显） | 1080 / 720 |
+            | L（NAS 级） | 1080 / 720（2160 需预转代理版，不在此列） |
+            | X（无硬编） | 720 |
+
+            返回一个点开就卡、或者直接 `TRANSCODER_BUSY` 的档位，比不提供更糟——用户会以为是自己网络的问题。
+        progressToken:
+          type: string
+          description: 进度回写的幂等票据，防多端并发覆盖
+        expiresAt:
+          type: string
+          format: date-time
+          description: URL 签名过期；过期后客户端重取本接口（同 sessionId 可延续）
+
+    HlsPlayback:
+      type: object
+      required: [url, protocol, startSegment, actualStartMs, segmentDurationMs]
+      properties:
+        url: { type: string, format: uri }
+        protocol:
+          type: string
+          const: hls
+        startSegment:
+          type: integer
+          description: |
+            **续播精度的关键**：`resumeFromMs` 向下对齐到分片边界
+            （6138000ms ÷ 4000ms = 1534.5 → 段 1534）。
+        actualStartMs:
+          type: integer
+          description: |
+            实际起点（6138000 → 6136000）。客户端**必须**用它校正进度条，
+            否则每次降级累积 0–4 秒漂移。
+        segmentDurationMs: { type: integer, examples: [4000] }
+        targetHeight: { type: integer }
+        targetCodec: { type: string, examples: [h264] }
+        tonemap:
+          type: [string, "null"]
+          enum: [hable, mobius, reinhard, none, null]
+
+    ClientCaps:
+      type: object
+      description: |
+        客户端自报能力。
+
+        **分两类，用途完全不同，不要混用**：
+
+        - `containers` —— **确定性事实**，来自播放器 API 的硬约束（AVPlayer 打不开 matroska
+          就是打不开，不是"可能不行"）。**只有这一类可以参与起播决策**，见 `GET /play/{mediaId}` 规则 0。
+        - `hwdec` / `codecs` / `hdr` / `audio` —— **概率性能力**，同一台设备不同视频解码器
+          状态都可能不同（硬解队列被占、驱动版本）。**禁止据此阻断起播**，只用于
+          失败后选降级方案与 24 屏自检展示。
+      properties:
+        containers:
+          type: array
+          items: { type: string }
+          examples:
+            - [mp4, mov, m4v]
+            - [mp4, mov, m4v, matroska, avi, ts]
+          description: |
+            **能直接打开的容器**（小写、不带点）。取自已验证的播放器事实，不是猜的：
+
+            | 引擎 | 典型值 |
+            |---|---|
+            | AVPlayer（iOS/macOS） | `[mp4, mov, m4v]` —— **不含 matroska**，也不含 `ts` |
+            | libmpv | 全格式（`mp4 mov m4v matroska avi ts flv wmv webm`） |
+            | ExoPlayer | `[mp4, mov, m4v, matroska, ts, webm]`，但 DTS 音轨需单独看 `audio` |
+
+            未上报本字段 = 服务端不知道容器支持情况 → `GET /play` 跳过 remux 判定，
+            一律 `direct`，失败后走 `error` → `fallback` 补救。这是刻意的降级方向：
+            **宁可多一次失败往返，也不要凭猜测拦在起播前**。
+        declaredAt:
+          type: [string, "null"]
+          format: date-time
+          description: 上报时间。播放器大版本变化后应重新上报（能力可能变）
+        hwdec:
+          type: array
+          items: { type: string }
+          examples: [[videotoolbox, mediacodec]]
+        codecs:
+          type: object
+          additionalProperties: { type: boolean }
+          examples:
+            - { hevc: true, hevc10bit: false, av1: false }
+        hdr:
+          type: object
+          additionalProperties: { type: boolean }
+          examples:
+            - { hdr10: false, dolby_vision: false }
+        audio:
+          type: object
+          additionalProperties: { type: boolean }
+          examples:
+            - { eac3: true, dts: false, truehd: false }
+        maxHeight: { type: integer }
+
+    PlaybackErrorRequest:
+      type: object
+      required: [phase, positionMs, engine, errorCode, clientCaps]
+      properties:
+        phase:
+          type: string
+          enum: [open, decode, audio, seek, network, unknown]
+          description: |
+            `open` 打不开/404/403 · `decode` 解码失败 · `audio` 有画无声 ·
+            `seek` 拖动后崩 · `network` 卡顿/断流
+        positionMs:
+          type: integer
+          minimum: 0
+          description: |
+            **失败时播放位置**，是"先播再报错"的核心证据：
+            `0` ≈ 起播即败（32 屏），`6138000` = 播到 1:42:18 才断（31 屏）。
+        at: { type: string, format: date-time }
+        engine:
+          type: string
+          enum: [mpv, avplayer, exoplayer, web]
+        errorCode:
+          type: string
+          description: 播放引擎原始错误码，服务端只做映射不解析
+          examples: [MPV_ERROR_DECODING]
+        errorMessage: { type: [string, "null"], maxLength: 512 }
+        engineLogTail:
+          type: [string, "null"]
+          description: ≤8192 字节，服务端截断保留
+        clientCaps:
+          $ref: "#/components/schemas/ClientCaps"
+
+    PlaybackReasonCode:
+      type: string
+      enum:
+        - HEVC10_HDR_UNSUPPORTED
+        - VIDEO_CODEC_UNSUPPORTED
+        - AUDIO_CODEC_UNSUPPORTED
+        - CONTAINER_UNSUPPORTED
+        - BANDWIDTH_INSUFFICIENT
+        - FILE_CORRUPT
+        - SERVER_BUSY
+        - DRM
+        - UNKNOWN
+      description: |
+        驱动 31/32 屏标题与说明，客户端查本地文案表。**标题按 `failedAtMs` 分两版**：
+
+        | reasonCode | `failedAtMs < 5000` | `failedAtMs >= 5000` |
+        |---|---|---|
+        | HEVC10_HDR_UNSUPPORTED | 这个文件无法直接播放 | 播放中断了 |
+        | VIDEO_CODEC_UNSUPPORTED | 这个文件无法直接播放 | 播放中断了 |
+        | AUDIO_CODEC_UNSUPPORTED | 这个文件没有声音 | 播放中断了 |
+        | CONTAINER_UNSUPPORTED | 这个文件无法直接播放 | 播放中断了 |
+        | BANDWIDTH_INSUFFICIENT | 网络跟不上了 | 播放中断了 |
+        | FILE_CORRUPT | 这个文件有损坏 | 播放中断了 |
+        | SERVER_BUSY | 服务器忙不过来 | 服务器忙不过来 |
+        | DRM | 这个文件受保护 | 这个文件受保护 |
+        | UNKNOWN | 播放出错了 | 播放出错了 |
+
+    ActionKind:
+      type: string
+      enum: [transcode, switch_audio, remux, skip_segment, retry, download, open_external]
+
+    PlaybackAction:
+      type: object
+      required: [id, kind, primary, params]
+      properties:
+        id:
+          type: string
+          examples: [act_transcode]
+        kind:
+          $ref: "#/components/schemas/ActionKind"
+        primary:
+          type: boolean
+          description: |
+            **数据驱动按钮**：客户端按 `actions` 数组顺序渲染，
+            `primary=true` 的用钴蓝填充（31 屏只有"转为 1080p 播放"是主按钮）。
+        label:
+          type: [string, "null"]
+          description: 可选强制覆盖，仅用于客户端文案表未覆盖的新动作；正常为 null
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            | kind | params |
+            |---|---|
+            | transcode | `targetHeight` `targetCodec` `tonemap` `estStartupMs` `cpuCoresUsed` `resumeFromMs` `segmentDurationMs` |
+            | switch_audio | `candidates[]`（`index` `codec` `channels` `title` `reason`） |
+            | remux | `targetContainer` |
+            | skip_segment | `fromMs` `toMs` |
+            | retry | `afterMs` |
+            | download | `url` `sizeBytes` |
+            | open_external | `uri` |
+
+            `estStartupMs` 是 31/32 屏脚注「转码需要约 {N} 秒启动，不影响正常使用」里 `{N}` 的唯一数据源
+            （四舍五入到整秒）。`cpuCoresUsed` **不参与拼文案**，只给诊断面板与弱机预警用。
+            两者都必须按「目标分辨率 + 源编码 + 本机实测编码倍率」计算，不能写常量——
+            服务端可能在 NAS，也可能在带独显的台式机上，同一份片源两者差 10 倍。
+
+            `switch_audio` **没候选就不给这个按钮**——31 屏"换一条音轨"不是写死的三个之一。
+
+    Diagnosis:
+      type: object
+      required: [diagnosisId, verdict, reasonCode, failedAtMs, resumePositionMs, actions, diagnosisExpiresAt]
+      properties:
+        diagnosisId: { type: string, pattern: "^dg_" }
+        verdict:
+          type: string
+          enum:
+            - codec_unsupported
+            - hdr_unsupported
+            - audio_unsupported
+            - container_unsupported
+            - bandwidth
+            - file_corrupt
+            - network
+            - drm
+            - server_busy
+            - unknown
+        reasonCode:
+          $ref: "#/components/schemas/PlaybackReasonCode"
+        reasonParams:
+          type: object
+          additionalProperties: true
+          description: 填文案里的变量：`codec`/`profile`/`hdr`/`bitDepth`/`needKbps`/`haveKbps`
+        failedAtMs:
+          type: integer
+          description: 回显 + 服务端校正后的失败点，驱动两版文案的分叉
+        resumePositionMs:
+          type: integer
+          description: |
+            等于 `failedAtMs`，对外承诺"进度保留在断点"。
+            **客户端起播时应自行回退约 2 秒**，避免从断点那一帧重崩；展示给用户的进度仍用 `failedAtMs`。
+        detail:
+          type: object
+          description: |
+            驱动右下角媒体信息行「HEVC Main 10 · HDR10 · 4K · 23.976 fps」「国语 5.1」。
+            **这是唯一允许服务端给拼好字符串的地方**，因为它是技术参数不是文案。
+          properties:
+            video: { type: string }
+            audio: { type: string }
+        actions:
+          type: array
+          items: { $ref: "#/components/schemas/PlaybackAction" }
+        logRef:
+          type: [string, "null"]
+        diagnosisExpiresAt:
+          type: string
+          format: date-time
+          description: |
+            诊断包作为**降级凭据**的失效时间（签发 + 30 分钟）。
+            31/32 屏据此判断"还能不能直接点降级"；已过期就提示重新播放，
+            别让用户点一次才收到 `410 DIAGNOSIS_EXPIRED`。
+
+    Capability:
+      type: object
+      required: [mediaId, canDirectPlay, confidence, reasons, network]
+      description: |
+        **非门禁接口。** `canDirectPlay: null` = 未验证，客户端不得据此阻断播放；
+        只有 `false` 且 `confidence: certain` 才有资格提示（仍不阻断）。
+      properties:
+        mediaId: { type: string }
+        canDirectPlay:
+          type: [boolean, "null"]
+          description: |
+            `true` / `false` / **`null`（未验证）**。
+            `null` 是在契约层面承认探测不可靠：31 屏的失败发生在 1:42:18，
+            任何请求前探测都预言不了。
+        confidence:
+          type: string
+          enum: [certain, likely, unverified]
+          description: "`certain` 只在服务端拿到该设备近期真实播放日志时才给"
+        reasons:
+          type: array
+          items:
+            type: object
+            required: [code, severity, basis]
+            properties:
+              code:
+                $ref: "#/components/schemas/PlaybackReasonCode"
+              severity:
+                type: string
+                enum: [certain, likely, info]
+                description: 驱动设置面板里的小黄标
+              params:
+                type: object
+                additionalProperties: true
+              basis:
+                type: string
+                enum: [CLIENT_CAPS, PLAYBACK_HISTORY, PROBE]
+        network:
+          type: object
+          properties:
+            link:
+              type: string
+              enum: [lan, tailscale, public]
+            estimatedKbps: { type: integer }
+            rttMs: { type: integer }
+            sufficientForSource: { type: boolean }
+        sourceBitrateKbps: { type: integer }
+        transcodeEstimate:
+          type: object
+          properties:
+            estStartupMs: { type: integer }
+            cpuCoresUsed:
+              type: number
+              description: |
+                预计占用的 CPU 核心数，允许小数（NVENC 场景典型 0.3）。
+                **不作为客户端文案的数据源**——31/32 屏脚注只用 estStartupMs。
+                仅供诊断面板与「这台机器跑不跑得动」的预警使用。
+            targetHeight: { type: integer }
+            wouldDropTo:
+              type: string
+              description: 驱动"如果转码会降到什么"的说明
+              examples: ["1080p SDR"]
+        checkedAt: { type: string, format: date-time }
+
+    ProgressUpdate:
+      type: object
+      required: [positionMs, progressToken]
+      properties:
+        positionMs: { type: integer, minimum: 0 }
+        durationMs: { type: integer }
+        playing: { type: boolean }
+        progressToken:
+          type: string
+          description: 不匹配 → `409 STALE_PROGRESS`（多端并发以最后写入为准，但拒绝乱序回写）
+
+    FallbackRequest:
+      type: object
+      required: [actionId]
+      description: |
+        凭据 `sessionId` / `diagnosisId` **二选一**，至少给一个：
+        - `sessionId` 有效 → `revivedFrom: session`
+        - 否则 `diagnosisId` 有效（30 分钟内、同设备）→ `revivedFrom: diagnosis`
+        - 都失效 → `404 SESSION_GONE`；都没给 → `400 MISSING_CREDENTIAL`
+
+        31/32 屏是可停留界面，用户犹豫两分钟后活会话早被 90 秒掉线回收，
+        所以降级不能依赖 `sessionId` 一定还在。
+      anyOf:
+        - required: [sessionId]
+        - required: [diagnosisId]
+      properties:
+        sessionId:
+          type: string
+          pattern: "^ps_"
+          description: 活会话。与 `diagnosisId` 都给时以它为准（活会话的轨信息更新）
+        diagnosisId:
+          type: string
+          pattern: "^dg_"
+          description: 4.2 返回的诊断 id；会话已回收时靠它复活。绑定签发时的 deviceId
+        actionId:
+          type: string
+          description: 来自诊断包 `actions[].id`；直接传 `kind` 也接受（兼容）
+        overrides:
+          type: object
+          description: 只允许 `targetHeight` / `targetCodec` / `tonemap` / `audioIndex`，其它键 → `422 UNSUPPORTED_OVERRIDE`
+          properties:
+            targetHeight: { type: integer, enum: [2160, 1080, 720] }
+            targetCodec: { type: string, enum: [h264, hevc] }
+            tonemap: { type: string, enum: [hable, mobius, reinhard, none] }
+            audioIndex: { type: integer }
+        resumeFromMs:
+          type: integer
+          description: 默认用诊断包的 `resumePositionMs`；两个凭据里都没带 → 从头播
+
+    FallbackResult:
+      type: object
+      required: [sessionId, revivedFrom, mode, ready, queuePosition, estStartMs, playback]
+      properties:
+        sessionId: { type: string, pattern: "^ps_" }
+        previousSessionId:
+          type: [string, "null"]
+          description: |
+            老会话，客户端应在其上调用 `POST /stop` 释放。
+            `revivedFrom == "diagnosis"` 时为 `null`（老会话早已回收）。
+        revivedFrom:
+          type: string
+          enum: [session, diagnosis]
+          description: |
+            `diagnosis` 表示老会话已回收、凭诊断包重建，客户端可提示「已重新建立播放会话」。
+        mode:
+          $ref: "#/components/schemas/PlaybackMode"
+        ready:
+          type: boolean
+          description: |
+            `false` 表示分片还没生成。client 按 `queuePosition` 分两支处理：
+
+            | `queuePosition` | 客户端动作 |
+            |---|---|
+            | `0` | 显示 8 秒加载态，等 WS `task.progress.firstSegmentReady`（`id == jobId`），WS 断线时轮询 `GET /play/{newSessionId}`（1s × 最多 30 次）兜底 |
+            | `>0` | 显示「前面有 N 部在转码」，**不要轮询**；等 WS `task.state` 该任务转 `running` 才进加载态 |
+
+            不要用轮询猜排队进度——`task.state` 已经是权威信号。
+        estReadyAt:
+          type: [string, "null"]
+          format: date-time
+        queuePosition:
+          type: integer
+          minimum: 0
+          description: |
+            0 = 已开始转码；>0 = 排在第 N 位（1 = 前面还有一个任务）。
+            转码器硬限 1 路，所以实际只会出现 0 或 1。
+            仅在 >0 时客户端显示「前面有 N 部在转码」，否则显示 8 秒加载态。
+        estStartMs:
+          type: integer
+          description: |
+            从响起到预计**首片就绪**的毫秒数，已含排队时间。
+            `queuePosition == 0` 时等于 `estStartupMs`（约 8000）；
+            排在第 1 位时是「前一个任务剩余时间 + 8000」。
+            这是客户端进度文案「约 N 秒/分钟」的唯一数据源，不要自己算。
+        jobId:
+          type: [string, "null"]
+          description: 转码任务 id，进 29 屏队列；失败可从此重试。也是匹配 WS `firstSegmentReady` 的键
+        playback:
+          $ref: "#/components/schemas/HlsPlayback"
+        expiresAt: { type: [string, "null"], format: date-time }
+
+
+
+
+
+    # ---------------------------------------------------------------- E. 设置
+    LanguageOption:
+      type: object
+      required: [code, label, coverage]
+      properties:
+        code: { type: string, example: "zh-CN" }
+        label: { type: string, example: "中文（简体）" }
+        coverage:
+          type: string
+          enum: [full, partial, none]
+          description: 驱动下拉项右侧的「部分译名」标注
+
+    CredentialState:
+      type: object
+      description: |
+        **永不回传凭据本身**。只给三件事：有没有配、是哪一种、末四位。
+      required: [configured, source]
+      properties:
+        configured: { type: boolean }
+        kind:
+          type: [string, "null"]
+          enum: [v4_token, v3_key, null]
+        hint:
+          type: [string, "null"]
+          description: 末四位（如 `…qGFk`），让用户确认填的是哪一把，不构成泄漏
+          example: "…qGFk"
+        source:
+          type: string
+          enum: [settings, env, none]
+          description: "`env` = 由启动参数注入，UI 显示「由环境变量提供，不可在此编辑」并禁用输入框"
+        updatedAt: { type: [string, "null"], format: date-time }
+
+    ConnectionState:
+      type: object
+      description: |
+        与 `CredentialState` **刻意分开**："填了 key" 和 "连得上" 是两件事。
+        国内家宽上 `api.themoviedb.org` 常被 DNS 污染，key 完全正确却连不上，
+        而两者修复动作完全不同（换 key vs 配代理）。
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [ok, unauthorized, unreachable, unchecked]
+        checkedAt: { type: [string, "null"], format: date-time }
+        latencyMs:
+          type: [integer, "null"]
+          description: 实测往返，用来解释"为什么海报墙慢"，也用来区分"能连但很差"和"完全不通"
+        message:
+          type: [string, "null"]
+          description: 英文诊断串，只进日志与「复制诊断信息」，不进 UI 正文
+
+    ProxyConfig:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [off, system, manual]
+        url:
+          type: [string, "null"]
+          description: "`manual` 时必填；`off` 时必须为 null"
+
+    CacheState:
+      type: object
+      required: [items, bytes, ttlDays, maxTtlDays]
+      properties:
+        items: { type: integer }
+        bytes: { type: integer }
+        oldestFetchedAt: { type: [string, "null"], format: date-time }
+        ttlDays:
+          type: integer
+          minimum: 1
+          maximum: 180
+        maxTtlDays:
+          type: integer
+          description: 恒为 180。TMDB 条款要求缓存不超过 6 个月；用户可调低，不可调高
+
+    Attribution:
+      type: object
+      required: [text, required]
+      properties:
+        text:
+          type: string
+          description: |
+            条款原文，服务端下发。会出现在 README / 07 设置页 / 关于页三处，
+            必须**逐字一致**；客户端不得改写、翻译或截断。
+          example: "This product uses the TMDB API but is not endorsed or certified by TMDB."
+        logoUrl:
+          type: [string, "null"]
+          description: 官方徽标，已代理到本机。不得改色、拉伸、翻转；醒目程度不得高于自有品牌
+        required: { type: boolean }
+
+    MetadataSettings:
+      type: object
+      required: [language, languageOptions, credential, connection, proxy, cache, attribution]
+      properties:
+        language: { type: string, example: "zh-CN" }
+        languageOptions:
+          type: array
+          items: { $ref: "#/components/schemas/LanguageOption" }
+        credential: { $ref: "#/components/schemas/CredentialState" }
+        connection: { $ref: "#/components/schemas/ConnectionState" }
+        proxy: { $ref: "#/components/schemas/ProxyConfig" }
+        cache: { $ref: "#/components/schemas/CacheState" }
+        attribution: { $ref: "#/components/schemas/Attribution" }
+
+    UpdateMetadataSettingsRequest:
+      type: object
+      description: |
+        全部字段可选，只传要改的。
+        `tmdbToken` 与 `clearToken` 互斥（同时给 → `400 VALIDATION_FAILED`）。
+      properties:
+        language: { type: string }
+        tmdbToken:
+          type: string
+          description: |
+            v4 JWT 或 v3 32 位 key 都接受。**写入前服务端会真打一次 `/3/configuration` 验证**，
+            失败返回 `422 TMDB_CREDENTIAL_INVALID` 且不写入。
+        clearToken: { type: boolean, default: false }
+        proxy: { $ref: "#/components/schemas/ProxyConfig" }
+        ttlDays:
+          type: integer
+          minimum: 1
+          maximum: 180

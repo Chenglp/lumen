@@ -33,7 +33,18 @@ lumen.db*
 /cache/
 /thumbs/
 /hls/
+/data/
 *.log
+
+# --- 凭据（绝不入库）---
+.env
+.env.*
+*.token
+credentials.json
+
+# --- Week 0 spike 产物 ---
+# spikes/ 里有 TMDB token 与本地绝对路径，属于一次性验证，不进代码库。
+/spikes/
 
 # --- Media (never commit a library) ---
 *.mkv
