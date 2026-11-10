@@ -1465,7 +1465,11 @@ components:
             「心动的信号」恋爱综艺，正确项在 rank 2）。长度差异**不得**作为降权理由。
         recommended:
           type: boolean
-          description: 驱动右上「推荐」角标；**最多 1 个为 true**
+          description: |
+            驱动右上「推荐」角标；**最多 1 个为 true**。两条硬约束：
+            ① 推荐分下限 0.65（挡掉「子串命中 + 年份不符 ≈ 0.63」这种名字像但八成不是的候选）；
+            ② 前两名分差 < 0.04 时**一个都不标**——角标只能有一个，
+            打平还标就等于把用户往错的方向推一次。依据见框架 §4.2.2
         recommendBasis:
           type: [string, "null"]
           enum: [SAME_SERIES, SAME_SEASON, EPISODE_TITLE_MATCH, null]
