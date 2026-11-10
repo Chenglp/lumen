@@ -233,8 +233,8 @@ PRAGMA temp_store   = MEMORY;
 |---|---|---|
 | `id` | TEXT PK | `um_` |
 | `volume_id` | TEXT FK | |
-| `rel_path` | TEXT | 相对**库根**，统一 `/` 分隔；给右栏「路径」行，也做去重依据 |
-| `path_key` | TEXT UNIQUE | `volume_id + foldCase(NFC(rel_path))` 的哈希，**去重的唯一依据**，见 §1.2 ②③ |
+| `rel_path` | TEXT | 相对**库根**，统一 `/` 分隔；给右栏「路径」行 |
+| `path_key` | TEXT UNIQUE | `volume_id + foldCase(NFC(卷相对路径))` 的哈希，**去重的唯一依据**，见 §1.2 ②③。注意括号里是**卷相对路径**（`root_rel + rel_path`），不是上一列 |
 | `library_id` | TEXT FK | |
 | `size_bytes` | INT | |
 | `mtime` | INT | 严重依赖：增量扫描靠它 |
@@ -247,13 +247,25 @@ PRAGMA temp_store   = MEMORY;
 | `probe` | TEXT | JSON，ffprobe 原始结果 |
 | `thumb_path` | TEXT | 本地缓存路径（相对 dataDir），非 URL |
 | `ignored_until` | INT NULL | TTL 预留，一期恒 NULL |
+| `missing_since` | INT NULL | 文件消失的时间；非空即「软删」，见 §4.1 |
 | `created_at` / `updated_at` | INT | |
+
+> **`rel_path` 与 `path_key` 用的不是同一个路径（v3.6 澄清）**
+>
+> `rel_path` 是**库相对**的（`a.mkv`），因为契约要求返回给客户端的是这个，
+> 客户端拼 `{libraryName}/{relPath}` 显示（契约 241 行）。
+> 但 `path_key` 必须用**卷相对**路径（`media/movie/a.mkv`）算——
+> 同一块盘上 `media/movie` 和 `media/tv` 两个库都可以有 `a.mkv`，
+> 用库相对路径算键会撞，第二个文件会被唯一约束挡掉。
+>
+> 实现见 `domain.VolumePathKey(volumeID, rootRel, libRel)`。
 
 索引：
 ```sql
 CREATE INDEX idx_unmatched_status ON unmatched(status, created_at DESC);
 CREATE INDEX idx_unmatched_lib    ON unmatched(library_id, status);
 CREATE INDEX idx_unmatched_mtime  ON unmatched(mtime);   -- 增量扫描比对
+CREATE INDEX idx_unmatched_missing ON unmatched(missing_since) WHERE missing_since IS NOT NULL;
 ```
 
 **`media`** — 已入库
@@ -268,8 +280,10 @@ CREATE INDEX idx_unmatched_mtime  ON unmatched(mtime);   -- 增量扫描比对
 | `season` / `episode` | INT NULL | |
 | `library_id` | TEXT FK | |
 | `volume_id` + `rel_path` | TEXT | **定位用**，`/` 分隔，**不存绝对路径**（§1.2 ①） |
-| `path_key` | TEXT UNIQUE | `sha256(volume_id ‖ 0x00 ‖ Fold(NFC(rel_path)))`，**唯一键** |
+| `path_key` | TEXT UNIQUE | `sha256(volume_id ‖ 0x00 ‖ Fold(NFC(卷相对路径)))`，**唯一键**，算法同 `unmatched` |
 | `file_path` | TEXT NULL | 最近一次解析出的绝对路径，**仅用于展示与排障**，不参与唯一性 |
+| `mtime` | INT | **增量扫描必需**：只认 `mtime + size` 判变化（v3.6 补，原文漏了） |
+| `missing_since` | INT NULL | 文件消失的时间；非空即「软删」，见 §4.1 |
 | `duration_ms` / `size_bytes` / `bitrate_kbps` | INT | **播放决策与 ETA 全靠这三列** |
 | `width` / `height` | INT | |
 | `video_codec` / `audio_codec` / `container` | TEXT | 直连判定的输入 |
@@ -385,6 +399,10 @@ walk(volume.mount, library.root_rel)
 每 200 文件一个事务批量提交 + 一次 checkpoint 进度上报。这是"暂停"的最小粒度——30 屏显示「已处理 8,486 / 12,480」时，中断最多丢 200 个文件的工作量。
 
 **卷状态先判**：`status=offline` 时直接跳过并推 `task.finished{needsAttention:true}`，不要去 walk 一个不存在的挂载点——Windows 上访问已拔出的盘符会阻塞数秒。同理，遍历中途遇到 `ERROR_NOT_READY` 要整体中止该卷，而不是当作"文件被删"把库里的记录清空。**"读不到"和"不存在"必须区分**，混为一谈的结果是拔一次移动硬盘，整卷观影记录被删。
+
+**消失只打标记，不删记录**（v3.6）：遍历完整结束后，库里记得、盘上没见到的记录写 `missing_since`，物理行保留。理由是 `playback_progress` 的 `media_id` 外键是 `ON DELETE CASCADE`——删 media 会连带删掉续播点，而这正是用户最在意的那部分数据。真正的清理由用户在 29 屏「需处理」里显式确认。
+
+判定消失有一个必要条件：**只有遍历完整结束（`Partial=false`）才做**。任何权限错误、被独占的目录、取消，都会让「没见到」和「不存在」不可区分，此时宁可不标。
 
 ### 4.2 文件名解析 → 候选 → 匹配
 
@@ -942,7 +960,12 @@ lumen/
 
 ---
 
-*文档版本 v3.5 · 2026-11-11 · 对应契约 v1.8 · 工期 12.5 周（已确认）*
+*文档版本 v3.6 · 2026-11-11 · 对应契约 v1.8 · 工期 12.5 周（已确认）*
+
+**v3.6 变更**（写扫描器时实测发现的三处缺项）：
+1. **`media` 补 `mtime` 列**。§4.1 说增量扫描「只认 mtime + size」，但 §3.1 的 media 表只有 `size_bytes`。缺了它，已入库文件的内容变化检测不到——只能靠 size，而重压一遍的片子 size 完全可能一致，于是永远不更新
+2. **澄清 `rel_path` 与 `path_key` 用的不是同一个路径**。`rel_path` 是库相对（给客户端显示），`path_key` 必须用卷相对——同一块盘上 `media/movie` 与 `media/tv` 两个库都可以有 `a.mkv`，用库相对算键会撞
+3. **补 `missing_since` 软删标记**（`media` 与 `unmatched` 各一列）。不直接 DELETE 的理由：`playback_progress` 是 `ON DELETE CASCADE`，删 media 会连带删掉续播点，拔一次盘就是整卷观影记录清空
 
 **v3.5 变更**（S1 落地时发现的自相矛盾，一处更正）：
 1. **`media` 的唯一键从 `file_path` 改为 `path_key`**。§3.1 原写 `UNIQUE(file_path)`，与 §1.2 ①「不存绝对路径」、§4.1「与 `media.path_key` 比对」、契约第 241 行「绝对路径不是稳定标识」三处冲突。取 `path_key`：盘符变化时才能命中同一行，否则同一部片子会入库两遍、进度分裂成两份，且不报错。`file_path` 降级为可空的展示/排障列

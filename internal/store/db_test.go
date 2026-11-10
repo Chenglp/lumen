@@ -24,8 +24,11 @@ func TestMigrateCreatesAllTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 1 || applied[0] != "0001_init" {
-		t.Fatalf("首次迁移应只应用 0001_init，实际 %v", applied)
+	if len(applied) != len(mustLoadMigrations(t)) {
+		t.Fatalf("首次迁移应用了 %v，期望全部 %d 个脚本", applied, len(mustLoadMigrations(t)))
+	}
+	if applied[0] != "0001_init" {
+		t.Fatalf("首个迁移应为 0001_init，实际 %v", applied)
 	}
 
 	want := []string{
@@ -184,7 +187,23 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != "0001_init" {
-		t.Fatalf("SchemaVersion = %q", v)
+	all := mustLoadMigrations(t)
+	want := all[len(all)-1].version
+	if v != want {
+		t.Fatalf("SchemaVersion = %q, 期望最后一个脚本 %q", v, want)
 	}
+}
+
+// mustLoadMigrations 让断言跟着 migrate/ 目录走，
+// 而不是把版本号写死在测试里——每加一个迁移就要改测试的话，早晚有人偷懒不写测试。
+func mustLoadMigrations(t *testing.T) []migration {
+	t.Helper()
+	all, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("加载迁移: %v", err)
+	}
+	if len(all) == 0 {
+		t.Fatal("没有任何迁移脚本")
+	}
+	return all
 }
