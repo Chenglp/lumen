@@ -16,6 +16,7 @@ import (
 
 	"github.com/Chenglp/lumen/internal/domain"
 	"github.com/Chenglp/lumen/internal/pipeline"
+	"github.com/Chenglp/lumen/internal/probe"
 	"github.com/Chenglp/lumen/internal/store"
 )
 
@@ -41,6 +42,10 @@ func run() error {
 		scanDir     = flag.String("scan", "", "注册该目录为媒体库并立即扫描一次，然后退出")
 		libKind     = flag.String("kind", "movie", "媒体库类型：movie | tv | photo | music")
 		libName     = flag.String("name", "", "媒体库显示名，默认取目录名")
+		doProbe     = flag.Bool("probe", false, "探测本机转码能力并落库，然后退出")
+		probeSample = flag.String("sample", "", "探测用的片源（不给则取库里最高/最大的一个）")
+		probeFast   = flag.Bool("probe-fast", false, "快速探测：跳过 4K 与 DV tonemap 两项")
+		probeSoft   = flag.Bool("probe-soft", false, "强制用软编探测（验证 M/L 档分支）")
 	)
 	flag.Parse()
 
@@ -81,6 +86,10 @@ func run() error {
 
 	if *scanDir != "" {
 		return runScan(ctx, db, *scanDir, *libKind, *libName)
+	}
+
+	if *doProbe {
+		return runProbe(ctx, db, *dataDir, *probeSample, *probeFast, *probeSoft)
 	}
 
 	if *migrateOnly {
@@ -161,6 +170,50 @@ func runScan(ctx context.Context, db *store.DB, dir, kind, name string) error {
 	}
 	if firstScan && res.Scanned == 0 {
 		fmt.Println("提示  : 目录里没有认出任何视频文件，检查扩展名或库里是不是还有子目录")
+	}
+	return nil
+}
+
+// runProbe 探测本机转码能力并落库。
+//
+// 样本的选择规则本身就带着一个判断：**优先用最高、最大的那个文件**。
+// 4K HEVC 10bit 是最难的解码组合，用它测出来的数与其它片源相比是保守的；
+// 反过来拿一部 720p 老片测，会把一台本来只能勉强转 1080p 的机器估成"轻松"，
+// 然后在真实片源上掉帧——这是最难受的一类错误，因为它在验收时不会出现。
+func runProbe(ctx context.Context, db *store.DB, dataDir, sample string, fast, forceSoft bool) error {
+	var candidates []probe.Sample
+	if sample == "" {
+		// 先找已入库的（有真实高度，挑得准）；S1 阶段库里还没有 media 行，
+		// 回退到 unmatched——扫描过但还没匹配的文件，高度未知，只能按大小挑。
+		if p, _, h, size, err := db.LargestMediaFile(ctx); err == nil {
+			candidates = append(candidates, probe.Sample{Path: p, Height: h, SizeBytes: size})
+		} else if p, size, err := db.LargestUnmatchedFile(ctx); err == nil {
+			candidates = append(candidates, probe.Sample{Path: p, SizeBytes: size})
+		}
+	}
+
+	fmt.Println("探测本机转码能力 …")
+	p := probe.Run(ctx, probe.Options{
+		Sample:        sample,
+		Candidates:    candidates,
+		DataDir:       dataDir,
+		Fast:          fast,
+		ForceSoftware: forceSoft,
+		Logf: func(format string, args ...any) {
+			fmt.Printf("  %s\n", fmt.Sprintf(format, args...))
+		},
+	})
+
+	fmt.Println()
+	fmt.Println("── 探测结果 ─────────────────────────────")
+	fmt.Print(probe.Report(p))
+
+	if err := db.SaveHostProfile(ctx, p); err != nil {
+		return err
+	}
+	fmt.Printf("\n已写入 host_profile（耗时 %d ms）\n", p.ProbeMS)
+	if p.SampleKind != "real" {
+		fmt.Println("提示: 本次没有真实片源样本，吞吐是折算出来的估计值；扫描入库后请重新探测。")
 	}
 	return nil
 }

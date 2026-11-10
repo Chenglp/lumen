@@ -33,8 +33,13 @@ test:
 # -race 需要 cgo（ThreadSanitizer 是 C++ runtime），与上面的 CGO_ENABLED=0 相反。
 # 本机需要 C 编译器（Windows 上是 mingw-w64，已装 WinLibs POSIX UCRT）。
 # 发布产物不受影响：build 目标仍然 CGO_ENABLED=0，输出纯 Go 单文件。
+#
+# -p 1 是必须的，不是保守：Windows 上并行编包会同时产出多个带 race 插桩的
+# 测试二进制（每个都比普通二进制大得多），杀软实时扫描会在 Go 删除它们时
+# 抓住文件句柄，报 "Access is denied" 而不是测试失败。串行执行反而更快
+# （实测 13 秒 vs 40 秒，因为不再有扫描争用）。Linux 上无此问题。
 race:
-	CGO_ENABLED=1 go test ./... -race -count=1
+	CGO_ENABLED=1 go test ./... -race -count=1 -p 1
 
 fmt:
 	gofmt -w -s .
