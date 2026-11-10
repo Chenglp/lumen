@@ -6,11 +6,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/Chenglp/lumen/internal/pipeline"
 	"github.com/Chenglp/lumen/internal/probe"
 	"github.com/Chenglp/lumen/internal/store"
+	"github.com/Chenglp/lumen/internal/tmdb"
 )
 
 // 版本信息在构建时注入：-ldflags "-X main.version=..."
@@ -47,6 +50,10 @@ func run() error {
 		probeFast   = flag.Bool("probe-fast", false, "快速探测：跳过 4K 与 DV tonemap 两项")
 		probeSoft   = flag.Bool("probe-soft", false, "强制用软编探测（验证 M/L 档分支）")
 		parseArg    = flag.String("parse", "", "只跑文件名解析：目录则遍历其中视频文件，其它值当作文件名，解析后退出")
+		matchArg    = flag.String("match", "", "对目录里的视频跑一遍解析 + TMDB 匹配，打印候选后退出")
+		matchMax    = flag.Int("match-max", 8, "匹配时最多处理多少个文件（每个文件至少 1 次请求）")
+		matchLimit  = flag.Int("match-limit", 3, "每个文件最多显示几个候选")
+		matchLang   = flag.String("lang", "zh-CN", "刮削语言，如 zh-CN / en-US")
 	)
 	flag.Parse()
 
@@ -58,6 +65,10 @@ func run() error {
 	// -parse 不碰数据库：解析是纯函数，验证它不该要求先建库。
 	if *parseArg != "" {
 		return runParse(*parseArg)
+	}
+
+	if *matchArg != "" {
+		return runMatch(*dataDir, *matchArg, *libKind, *matchLang, *matchLimit, *matchMax)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -327,4 +338,160 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// runMatch 把「解析 → 搜索 → 打分」整条链在真实文件上跑一遍。
+//
+// 存在的理由和 -parse、-probe 一样：这条链的每一环都有单测，但它们都是
+// 拿我手写的响应喂出来的。真机跑一遍才能回答三个测试回答不了的问题：
+// 真实片名搜得到吗、年份信号在真数据上起作用吗、一条要花几次请求。
+func runMatch(dataDir, root, kind, lang string, limit, max int) error {
+	token := strings.TrimSpace(os.Getenv("LUMEN_TMDB_TOKEN"))
+	if token == "" {
+		return fmt.Errorf("未设置 LUMEN_TMDB_TOKEN（TMDB v4 Read Access Token）")
+	}
+	if limit <= 0 {
+		limit = 3
+	}
+	if max <= 0 {
+		max = 8
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 缓存用真库：这样反复跑同一批文件时能看出来「第二次是不是 0 请求」，
+	// 而那正是 27 小时里唯一能被省掉的部分。
+	db, err := store.Open(filepath.Join(dataDir, "lumen.db"))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	c := tmdb.New(token, tmdb.WithLanguage(lang), tmdb.WithCache(db))
+
+	var files []string
+	fi, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() {
+		err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if p != root && domain.IsJunk(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !domain.IsVideoFile(d.Name()) {
+				return nil
+			}
+			files = append(files, p)
+			if len(files) >= max {
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		files = append(files, root)
+	}
+
+	if len(files) == 0 {
+		fmt.Println("没有找到受支持的视频文件")
+		return nil
+	}
+
+	// 有 ffmpeg 就读容器 tag：那是最省的一层（0 次搜索，1 次详情）。
+	// 读不到也不影响——三级优先级的意义就是每一层都能独立工作。
+	bin, _ := probe.Find()
+
+	var (
+		totalReq   int
+		totalCache int
+		totalTag   int
+		started    = time.Now()
+	)
+	for _, p := range files {
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil || fi.IsDir() == false {
+			rel = filepath.Base(p)
+		}
+		rel = filepath.ToSlash(rel)
+
+		q := domain.MatchQuery{Result: domain.ParsePath(rel), LibKind: kind, Lang: lang}
+		var hint tmdb.Hint
+		if bin != nil {
+			if tags, tagErr := bin.FormatTags(ctx, p); tagErr == nil {
+				hint = tmdb.HintFromTags(tags)
+			}
+		}
+		if hint.TMDBID > 0 {
+			totalTag++
+		}
+
+		t0 := time.Now()
+		res, err := c.Resolve(ctx, tmdb.Lookup{Query: q, Type: kind, Hint: hint, Limit: limit, Enrich: 1})
+		if err != nil {
+			fmt.Printf("\n%s\n  失败  %v\n", rel, err)
+			if errors.Is(err, tmdb.ErrUnavailable) || errors.Is(err, tmdb.ErrUnauthorized) {
+				return fmt.Errorf("中断：%w", err) // 网络/凭据问题，继续跑只会重复失败
+			}
+			continue
+		}
+		totalReq += res.Requests
+		if res.Requests == 0 {
+			totalCache++
+		}
+
+		fmt.Printf("\n%s\n", rel)
+		fmt.Printf("  解析  %s%s   判定 %s · 把握 %.3f\n",
+			orDash(q.Result.Parsed.Title), yearSuffix(q.Result.Parsed.Year), res.Code, res.Confidence)
+		flags := []string{res.Source}
+		if res.Confirmed {
+			flags = append(flags, "文件自带 id")
+		}
+		if res.YearDropped {
+			flags = append(flags, "去年份重搜")
+		}
+		if res.Disagreement {
+			flags = append(flags, "nfo 与文件名不一致")
+		}
+		fmt.Printf("  过程  %s · %d 请求 · %dms\n",
+			strings.Join(flags, " / "), res.Requests, time.Since(t0).Milliseconds())
+
+		for i, h := range res.Hits {
+			if i >= limit {
+				break
+			}
+			star := " "
+			if h.Recommended {
+				star = "★"
+			}
+			fmt.Printf("  %s#%d %-7d %-5s %s%s  score=%.3f\n",
+				star, i+1, h.TMDBID, h.MediaType, h.Title, yearSuffix(h.Year), h.Score)
+		}
+		if len(res.Hits) == 0 {
+			fmt.Printf("  （无候选）\n")
+		}
+	}
+
+	fmt.Printf("\n%d 个文件 · %d 个带容器 tag · %d 次请求 · %d 个命中缓存 · 耗时 %s\n",
+		len(files), totalTag, totalReq, totalCache, time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func yearSuffix(y *int) string {
+	if y == nil {
+		return ""
+	}
+	return fmt.Sprintf(" (%d)", *y)
 }
